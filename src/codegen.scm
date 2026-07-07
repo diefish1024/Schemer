@@ -12,7 +12,8 @@
     (let walk ([x program])
       (cond
         [(frame-var? x)
-         (make-disp-opnd frame-pointer-register (* 8 (frame-var->index x)))]
+         (make-disp-opnd frame-pointer-register
+           (ash (frame-var->index x) align-shift))]
         [(pair? x) (cons (walk (car x)) (walk (cdr x)))]
         [else x]))))
 

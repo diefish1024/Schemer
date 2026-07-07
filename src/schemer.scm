@@ -10,5 +10,6 @@
 
 (load "src/utils.scm")     ; compiler-wide helpers (conflict graph, subst)
 (load "src/verify.scm")    ; front-end verification
+(load "src/frontend.scm")  ; front-end lowering (a6+): calls, args, returns
 (load "src/alloc.scm")     ; register & frame allocation cluster (a4/a5)
 (load "src/codegen.scm")   ; back end: intermediate language -> x86-64

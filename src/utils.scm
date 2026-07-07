@@ -8,6 +8,15 @@
 (define int?
   (lambda (x) (and (integer? x) (exact? x))))
 
+(define binop?
+  (lambda (x) (and (memq x '(+ - * logand logor sra)) #t)))
+
+;; A Triv in the source UIL: uvar, int, label, or an already-assigned
+;; location (register / frame-var).  Used by the a6+ front-end passes.
+(define triv?
+  (lambda (x)
+    (or (uvar? x) (int? x) (label? x) (register? x) (frame-var? x))))
+
 ;; Backward live analysis that builds a conflict graph.  loc? selects the
 ;; fixed locations to track alongside uvars: register? for register
 ;; conflicts, frame-var? for frame conflicts.  Returns an assoc list
