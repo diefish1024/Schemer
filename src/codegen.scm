@@ -3,19 +3,85 @@
 ;;;   expose-frame-var  expose-basic-blocks  flatten-program  generate-x86-64
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; expose-frame-var  (a2, generalized in a3)
+;;; expose-frame-var  (a2/a3, made flow-sensitive in a7)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Replace each frame variable fvN with a displacement operand
-;;; #<disp rbp 8N>, as a grammar-independent tree walk.
+;;; #<disp rbp (8N - off)>.  Because a7 bumps the frame pointer around
+;;; nontail calls, we track the running byte offset `off` by which rbp
+;;; has been advanced and subtract it from each frame-var displacement.
 (define-who expose-frame-var
   (lambda (program)
-    (let walk ([x program])
-      (cond
-        [(frame-var? x)
-         (make-disp-opnd frame-pointer-register
-           (ash (frame-var->index x) align-shift))]
-        [(pair? x) (cons (walk (car x)) (walk (cdr x)))]
-        [else x]))))
+    (define fp frame-pointer-register)
+    (define fv->disp
+      (lambda (x off)
+        (if (frame-var? x)
+            (make-disp-opnd fp (- (ash (frame-var->index x) align-shift) off))
+            x)))
+    ;; Triv / operand rewrite (no fp change): plain substitution.
+    (define Triv (lambda (x off) (fv->disp x off)))
+    (define Effect
+      (lambda (ef off)
+        (match ef
+          [(nop) (values '(nop) off)]
+          [(set! ,v (,op ,t1 ,t2)) (guard (eq? v fp) (memq op '(+ -)) (int? t2))
+           ;; frame-pointer adjustment: shift the running offset
+           (values `(set! ,fp (,op ,fp ,t2))
+                   (if (eq? op '+) (+ off t2) (- off t2)))]
+          [(set! ,v (,op ,t1 ,t2))
+           (values `(set! ,(fv->disp v off) (,op ,(fv->disp t1 off) ,(fv->disp t2 off))) off)]
+          [(set! ,v ,t) (values `(set! ,(fv->disp v off) ,(fv->disp t off)) off)]
+          [(return-point ,rp-lab ,tail)
+           (let-values ([(t o^) (Tail tail off)])
+             (values `(return-point ,rp-lab ,t) o^))]
+          [(if ,p ,c ,a)
+           (let-values ([(p^ po) (Pred p off)])
+             (let-values ([(c^ co) (Effect c po)] [(a^ ao) (Effect a po)])
+               (values `(if ,p^ ,c^ ,a^) co)))]
+          [(begin ,ef* ... ,e)
+           (let-values ([(ef*^ o^) (Effect* ef* off)])
+             (let-values ([(e^ o^^) (Effect e o^)])
+               (values (make-begin `(,@ef*^ ,e^)) o^^)))])))
+    (define Effect*
+      (lambda (ef* off)
+        (if (null? ef*)
+            (values '() off)
+            (let-values ([(e^ o^) (Effect (car ef*) off)])
+              (let-values ([(rest o^^) (Effect* (cdr ef*) o^)])
+                (values (cons e^ rest) o^^))))))
+    (define Pred
+      (lambda (pr off)
+        (match pr
+          [(true) (values '(true) off)]
+          [(false) (values '(false) off)]
+          [(,relop ,t1 ,t2) (guard (relop? relop))
+           (values `(,relop ,(fv->disp t1 off) ,(fv->disp t2 off)) off)]
+          [(if ,p ,c ,a)
+           (let-values ([(p^ po) (Pred p off)])
+             (let-values ([(c^ co) (Pred c po)] [(a^ ao) (Pred a po)])
+               (values `(if ,p^ ,c^ ,a^) co)))]
+          [(begin ,ef* ... ,p)
+           (let-values ([(ef*^ o^) (Effect* ef* off)])
+             (let-values ([(p^ o^^) (Pred p o^)])
+               (values (make-begin `(,@ef*^ ,p^)) o^^)))])))
+    (define Tail
+      (lambda (t off)
+        (match t
+          [(if ,p ,c ,a)
+           (let-values ([(p^ po) (Pred p off)])
+             (let-values ([(c^ co) (Tail c po)] [(a^ ao) (Tail a po)])
+               (values `(if ,p^ ,c^ ,a^) co)))]
+          [(begin ,ef* ... ,t)
+           (let-values ([(ef*^ o^) (Effect* ef* off)])
+             (let-values ([(t^ o^^) (Tail t o^)])
+               (values (make-begin `(,@ef*^ ,t^)) o^^)))]
+          [(,triv ,loc* ...)
+           (values `(,(fv->disp triv off) ,@(map (lambda (l) (fv->disp l off)) loc*)) off)])))
+    (match program
+      [(letrec ([,label (lambda () ,tail*)] ...) ,tail)
+       (let ([tail*^ (map (lambda (t) (let-values ([(t^ o) (Tail t 0)]) t^)) tail*)]
+             [tail^ (let-values ([(t^ o) (Tail tail 0)]) t^)])
+         `(letrec ([,label (lambda () ,tail*^)] ...) ,tail^))]
+      [,x (format-error who "invalid Program ~s" x)])))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; expose-basic-blocks  (a3)
@@ -83,6 +149,11 @@
            (let-values ([(et eb*) (Effect ef tail)])
              (let-values ([(bt bb*) (Effect* ef* et)])
                (values bt (append bb* eb*))))]
+          [(return-point ,rp-lab ,rp-tail)
+           ;; the code after the call continues at rp-lab; the inner tail
+           ;; ends in the callee jump.
+           (let-values ([(rt rb*) (Tail rp-tail)])
+             (values rt (append rb* `([,rp-lab (lambda () ,tail)]))))]
           [(set! ,lhs ,rhs)
            (values (make-begin `((set! ,lhs ,rhs) ,tail)) '())]
           [,x (format-error who "invalid Effect ~s" x)])))

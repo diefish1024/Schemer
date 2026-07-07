@@ -8,18 +8,28 @@
 ;;;   discard-call-live  finalize-locations
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; uncover-frame-conflict  (a5)
+;;; uncover-frame-conflict  (a5, extended in a7 with call-live)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Like register conflicts, but tracks frame variables instead of
-;;; registers (all locals pessimistically assumed frame-bound).
+;;; registers (all locals pessimistically assumed frame-bound).  Also
+;;; gathers the call-live variables/frame-locations (those live across a
+;;; return-point) for pre-assign-frame and assign-new-frame.
 (define-who uncover-frame-conflict
   (lambda (program)
     (define Body
       (lambda (bd)
         (match bd
-          [(locals (,uvar* ...) ,tail)
-           `(locals (,uvar* ...)
-              (frame-conflict ,(build-conflict-graph uvar* tail frame-var?) ,tail))]
+          [(locals (,uvar* ...) (new-frames (,frame* ...) ,tail))
+           (let ([cl '()])
+             (define call-live!
+               (lambda (live) (set! cl (union cl live))))
+             (let ([ct (build-conflict-graph uvar* tail frame-var? call-live!)])
+               (let ([cl-uvar* (filter uvar? cl)])
+                 `(locals (,uvar* ...)
+                    (new-frames (,frame* ...)
+                      (spills (,cl-uvar* ...)
+                        (frame-conflict ,ct
+                          (call-live (,cl ...) ,tail))))))))]
           [,x (format-error who "invalid Body ~s" x)])))
     (match program
       [(letrec ([,label (lambda () ,[Body -> body*])] ...) ,[Body -> body])
@@ -48,7 +58,137 @@
       [,x (format-error who "invalid Program ~s" x)])))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; select-instructions  (a5)
+;;; assign-frame helpers (shared by pre-assign-frame / assign-frame)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Give each spilled variable a frame home compatible with the frame
+;;; conflict graph and the homes already assigned this run.
+(define first-free-frame
+  (lambda (used)
+    (let loop ([i 0])
+      (let ([fv (index->frame-var i)])
+        (if (memq fv used) (loop (+ i 1)) fv)))))
+(define assign-spills
+  (lambda (spill* fcg home*)
+    (if (null? spill*)
+        home*
+        (let* ([x (car spill*)]
+               [conf (cond [(assq x fcg) => cdr] [else '()])]
+               [used (fold-right
+                       (lambda (c acc)
+                         (cond
+                           [(frame-var? c) (set-cons c acc)]
+                           [(assq c home*) => (lambda (p) (set-cons (cadr p) acc))]
+                           [else acc]))
+                       '() conf)])
+          (assign-spills (cdr spill*) fcg
+            (cons (list x (first-free-frame used)) home*))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; pre-assign-frame  (a7)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Assign frame homes to the call-live (spilled) variables before the
+;;; iteration begins, replacing the spills form with a locate form.
+(define-who pre-assign-frame
+  (lambda (program)
+    (define Body
+      (lambda (bd)
+        (match bd
+          [(locals (,local* ...)
+             (new-frames (,frame* ...)
+               (spills (,spill* ...)
+                 (frame-conflict ,fcg
+                   (call-live (,cl* ...) ,tail)))))
+           ;; spilled (call-live) vars get frame homes now and leave locals.
+           `(locals ,(difference local* spill*)
+              (new-frames (,frame* ...)
+                (locate ,(assign-spills spill* fcg '())
+                  (frame-conflict ,fcg
+                    (call-live (,cl* ...) ,tail)))))]
+          [,x (format-error who "invalid Body ~s" x)])))
+    (match program
+      [(letrec ([,label (lambda () ,[Body -> body*])] ...) ,[Body -> body])
+       `(letrec ([,label (lambda () ,body*)] ...) ,body)]
+      [,x (format-error who "invalid Program ~s" x)])))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; assign-new-frame  (a7)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Determine this body's frame size from the call-live locations, place
+;;; each outgoing new-frame variable just above the frame, and rewrite
+;;; each return-point to bump the frame pointer around the call.  Drops
+;;; the new-frames/call-live wrappers and introduces the ulocals form.
+(define-who assign-new-frame
+  (lambda (program)
+    (define locate->index
+      (lambda (loc*)
+        ;; max frame index among the call-live locations; -1 if none.
+        (lambda (x)
+          (cond
+            [(frame-var? x) (frame-var->index x)]
+            [(assq x loc*) => (lambda (p) (frame-var->index (cadr p)))]
+            [else -1]))))            ; register-homed: no frame index
+    (define Body
+      (lambda (bd)
+        (match bd
+          [(locals (,local* ...)
+             (new-frames (,frame* ...)
+               (locate (,home* ...)
+                 (frame-conflict ,fcg
+                   (call-live (,cl* ...) ,tail)))))
+           (let* ([idx (locate->index home*)]
+                  [size (+ 1 (fold-left (lambda (m x) (max m (idx x))) -1 cl*))]
+                  ;; assign each frame's new-frame vars to fv_size, fv_{size+1}, ...
+                  [nf-home*
+                   (apply append
+                     (map (lambda (nfv*)
+                            (let loop ([nfv* nfv*] [i size] [acc '()])
+                              (if (null? nfv*)
+                                  (reverse acc)
+                                  (loop (cdr nfv*) (+ i 1)
+                                    (cons (list (car nfv*) (index->frame-var i)) acc)))))
+                          frame*))]
+                  [nb (ash size align-shift)])
+             ;; rewrite return-points to bump fp by nb around the call
+             (define Effect
+               (lambda (ef)
+                 (match ef
+                   [(nop) '(nop)]
+                   [(set! ,var ,rhs) `(set! ,var ,rhs)]
+                   [(return-point ,rp-lab ,tail)
+                    (make-begin
+                      `((set! ,frame-pointer-register
+                              (+ ,frame-pointer-register ,nb))
+                        (return-point ,rp-lab ,tail)
+                        (set! ,frame-pointer-register
+                              (- ,frame-pointer-register ,nb))))]
+                   [(if ,[Pred -> p] ,[Effect -> c] ,[Effect -> a]) `(if ,p ,c ,a)]
+                   [(begin ,[Effect -> ef*] ... ,[Effect -> e]) (make-begin `(,@ef* ,e))])))
+             (define Pred
+               (lambda (pr)
+                 (match pr
+                   [(true) '(true)]
+                   [(false) '(false)]
+                   [(,relop ,t1 ,t2) (guard (relop? relop)) `(,relop ,t1 ,t2)]
+                   [(if ,[Pred -> p] ,[Pred -> c] ,[Pred -> a]) `(if ,p ,c ,a)]
+                   [(begin ,[Effect -> ef*] ... ,[Pred -> p]) (make-begin `(,@ef* ,p))])))
+             (define Tail
+               (lambda (t)
+                 (match t
+                   [(if ,[Pred -> p] ,[Tail -> c] ,[Tail -> a]) `(if ,p ,c ,a)]
+                   [(begin ,[Effect -> ef*] ... ,[Tail -> t]) (make-begin `(,@ef* ,t))]
+                   [(,triv ,loc* ...) `(,triv ,@loc*)])))
+             `(locals ,(difference local* (apply append frame*))
+                (ulocals ()
+                  (locate (,@home* ,@nf-home*)
+                    (frame-conflict ,fcg ,(Tail tail))))))]
+          [,x (format-error who "invalid Body ~s" x)])))
+    (match program
+      [(letrec ([,label (lambda () ,[Body -> body*])] ...) ,[Body -> body])
+       `(letrec ([,label (lambda () ,body*)] ...) ,body)]
+      [,x (format-error who "invalid Program ~s" x)])))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; select-instructions  (a5, extended in a7 with return-point)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Rewrite the code so it obeys x86-64 constraints, introducing
 ;;; unspillable temporaries (added to ulocals) where registers are
@@ -131,6 +271,7 @@
                    [(nop) '(nop)]
                    [(set! ,var (,op ,t1 ,t2)) (select-binop var op t1 t2)]
                    [(set! ,var ,t) (select-move var t)]
+                   [(return-point ,rp-lab ,[Tail -> tail]) `(return-point ,rp-lab ,tail)]
                    [(if ,p ,c ,a) `(if ,(Pred p) ,(Effect c) ,(Effect a))]
                    [(begin ,ef* ... ,e) (make-begin `(,@(map Effect ef*) ,(Effect e)))])))
              (define Pred
@@ -317,15 +458,33 @@
       [,x (format-error who "invalid Program ~s" x)])))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; discard-call-live  (a4)
+;;; discard-call-live  (a4, extended in a7 for return-point calls)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Drop the call-live locations from every call, both the tail call and
+;;; the call inside each return-point.
 (define-who discard-call-live
   (lambda (program)
+    (define Effect
+      (lambda (ef)
+        (match ef
+          [(nop) '(nop)]
+          [(set! ,var ,rhs) `(set! ,var ,rhs)]
+          [(return-point ,rp-lab ,[Tail -> t]) `(return-point ,rp-lab ,t)]
+          [(if ,[Pred -> p] ,[Effect -> c] ,[Effect -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Effect -> ef*] ... ,[Effect -> e]) (make-begin `(,@ef* ,e))])))
+    (define Pred
+      (lambda (pr)
+        (match pr
+          [(true) '(true)]
+          [(false) '(false)]
+          [(,relop ,t1 ,t2) (guard (relop? relop)) `(,relop ,t1 ,t2)]
+          [(if ,[Pred -> p] ,[Pred -> c] ,[Pred -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Effect -> ef*] ... ,[Pred -> p]) (make-begin `(,@ef* ,p))])))
     (define Tail
       (lambda (t)
         (match t
-          [(if ,pred ,[Tail -> c] ,[Tail -> a]) `(if ,pred ,c ,a)]
-          [(begin ,ef* ... ,[Tail -> t]) `(begin ,ef* ... ,t)]
+          [(if ,[Pred -> p] ,[Tail -> c] ,[Tail -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Effect -> ef*] ... ,[Tail -> t]) (make-begin `(,@ef* ,t))]
           [(,triv ,loc* ...) `(,triv)]
           [,x (format-error who "invalid Tail ~s" x)])))
     (define Body

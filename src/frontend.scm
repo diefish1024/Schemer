@@ -56,7 +56,10 @@
                    [(set! ,uvar ,[Value -> v]) `(set! ,uvar ,v)]
                    [(if ,[Pred -> p] ,[Effect -> c] ,[Effect -> a]) `(if ,p ,c ,a)]
                    [(begin ,[Effect -> ef*] ... ,[Effect -> e])
-                    (make-begin `(,@ef* ,e))])))
+                    (make-begin `(,@ef* ,e))]
+                   [(,rator ,rand* ...)              ; nontail call in effect
+                    (let-values ([(t* ef*) (Triv* (cons rator rand*))])
+                      (make-begin `(,@ef* (,@t*))))])))
              (define Pred
                (lambda (pr)
                  (match pr
@@ -109,7 +112,8 @@
           [(nop) '(nop)]
           [(set! ,var ,rhs) (Set var rhs)]
           [(if ,[Pred -> p] ,[Effect -> c] ,[Effect -> a]) `(if ,p ,c ,a)]
-          [(begin ,[Effect -> ef*] ... ,[Effect -> e]) (make-begin `(,@ef* ,e))])))
+          [(begin ,[Effect -> ef*] ... ,[Effect -> e]) (make-begin `(,@ef* ,e))]
+          [(,rator ,rand* ...) `(,rator ,rand* ...)])))  ; nontail call
     (define Pred
       (lambda (pr)
         (match pr
@@ -157,37 +161,59 @@
             [(pair? regs) (loop (+ i 1) (cdr regs) (cons (car regs) acc))]
             [else (loop (+ i 1) '()
                     (cons (index->frame-var (- i (length parameter-registers))) acc))]))))
+    ;; separate the frame-var argument sets before the register ones, so
+    ;; the parameter registers have the shortest live ranges.
+    (define frame-first
+      (lambda (sets locs)
+        (let loop ([sets sets] [locs locs] [f '()] [r '()])
+          (if (null? sets)
+              (append (reverse f) (reverse r))
+              (if (frame-var? (car locs))
+                  (loop (cdr sets) (cdr locs) (cons (car sets) f) r)
+                  (loop (cdr sets) (cdr locs) f (cons (car sets) r)))))))
     (define Body
       (lambda (bd fml*)
         (match bd
           [(locals (,local* ...) ,tail)
-           (let ([rp (unique-name 'rp)])
-             ;; A call in tail position: (rator rand ...)
-             (define Call
+           (let ([rp (unique-name 'rp)] [nf* '()] [new-local* '()])
+             (define new-nfv
+               (lambda ()
+                 (let ([u (unique-name 'nfv)])
+                   (set! new-local* (cons u new-local*)) u)))
+             ;; A tail call: return address is the enclosing body's rp.
+             (define Tail-call
                (lambda (rator rand*)
                  (let* ([locs (arg-locations (length rand*))]
-                        ;; assign frame args first, then register args (reverse
-                        ;; so registers -- shortest live ranges -- come last)
-                        [set-args (map (lambda (loc r) `(set! ,loc ,r)) locs rand*)]
-                        [set-args (frame-first set-args locs)])
+                        [set-args (frame-first
+                                    (map (lambda (loc r) `(set! ,loc ,r)) locs rand*)
+                                    locs)])
                    (make-begin
                      `(,@set-args
                        (set! ,ra ,rp)
                        (,rator ,fp ,ra ,@locs))))))
-             ;; separate frame-var sets before register sets
-             (define frame-first
-               (lambda (sets locs)
-                 (let-values ([(fsets rsets)
-                               (partition-sets sets locs)])
-                   (append fsets rsets))))
-             (define partition-sets
-               (lambda (sets locs)
-                 (let loop ([sets sets] [locs locs] [f '()] [r '()])
-                   (if (null? sets)
-                       (values (reverse f) (reverse r))
-                       (if (frame-var? (car locs))
-                           (loop (cdr sets) (cdr locs) (cons (car sets) f) r)
-                           (loop (cdr sets) (cdr locs) f (cons (car sets) r)))))))
+             ;; A nontail call: wrap a return-point.  Frame args go into
+             ;; fresh new-frame variables (assign-new-frame places them).
+             (define Nontail-call
+               (lambda (rator rand*)
+                 (let* ([n (length rand*)]
+                        [nreg (length parameter-registers)]
+                        [reg-locs (list-head parameter-registers (min n nreg))]
+                        [nfv* (map (lambda (_) (new-nfv))
+                                   (make-list (max 0 (- n nreg))))]
+                        [locs (append reg-locs nfv*)]
+                        [rp-lab (unique-label 'rp)]
+                        ;; frame (new-frame) sets first, then register sets
+                        [set-frame (map (lambda (v r) `(set! ,v ,r))
+                                        nfv* (list-tail rand* (min n nreg)))]
+                        [set-reg (map (lambda (v r) `(set! ,v ,r))
+                                      reg-locs (list-head rand* (min n nreg)))])
+                   (set! nf* (cons nfv* nf*))
+                   `(return-point ,rp-lab
+                      ,(make-begin
+                         `(,@set-frame
+                           ,@set-reg
+                           (set! ,ra ,rp-lab)
+                           (,rator ,fp ,ra ,@locs)))))))
              (define Tail
                (lambda (t)
                  (match t
@@ -197,14 +223,21 @@
                     (make-begin `((set! ,rv (,binop ,x ,y)) (,rp ,fp ,rv)))]
                    [,triv (guard (triv? triv))
                     (make-begin `((set! ,rv ,triv) (,rp ,fp ,rv)))]
-                   [(,rator ,rand* ...) (Call rator rand*)])))
+                   [(,rator ,rand* ...) (Tail-call rator rand*)])))
              (define Effect
                (lambda (ef)
                  (match ef
                    [(nop) '(nop)]
+                   [(set! ,var (,binop ,x ,y)) (guard (binop? binop))
+                    `(set! ,var (,binop ,x ,y))]
+                   [(set! ,var (,rator ,rand* ...))       ; nontail call, keep value
+                    (make-begin
+                      `(,(Nontail-call rator rand*)
+                        (set! ,var ,rv)))]
                    [(set! ,var ,rhs) `(set! ,var ,rhs)]
                    [(if ,[Pred -> p] ,[Effect -> c] ,[Effect -> a]) `(if ,p ,c ,a)]
-                   [(begin ,[Effect -> ef*] ... ,[Effect -> e]) (make-begin `(,@ef* ,e))])))
+                   [(begin ,[Effect -> ef*] ... ,[Effect -> e]) (make-begin `(,@ef* ,e))]
+                   [(,rator ,rand* ...) (Nontail-call rator rand*)])))
              (define Pred
                (lambda (pr)
                  (match pr
@@ -217,11 +250,12 @@
              (let* ([locs (arg-locations (length fml*))]
                     [set-params (map (lambda (x loc) `(set! ,x ,loc)) fml* locs)]
                     [tail^ (Tail tail)])
-               `(locals (,rp ,@fml* ,@local*)
-                  ,(make-begin
-                     `((set! ,rp ,ra)
-                       ,@set-params
-                       ,tail^)))))]
+               `(locals (,rp ,@new-local* ,@fml* ,@local*)
+                  (new-frames ,(reverse nf*)
+                    ,(make-begin
+                       `((set! ,rp ,ra)
+                         ,@set-params
+                         ,tail^))))))]
           [,x (format-error who "invalid Body ~s" x)])))
     (match program
       [(letrec ([,label (lambda (,fml** ...) ,body*)] ...) ,body)

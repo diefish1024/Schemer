@@ -22,7 +22,8 @@
 ;; conflicts, frame-var? for frame conflicts.  Returns an assoc list
 ;; mapping each uvar to the uvars/locations it conflicts with.
 (define build-conflict-graph
-  (lambda (uvar* tail loc?)
+  (lambda (uvar* tail loc? . opt)
+    (define call-live! (and (pair? opt) (car opt)))
     (define track? (lambda (x) (or (uvar? x) (loc? x))))
     (define ->set
       (lambda (ls) (fold-right (lambda (x s) (if (track? x) (set-cons x s) s)) '() ls)))
@@ -45,12 +46,20 @@
     (define Effect*
       (lambda (ef* live)
         (if (null? ef*) live (Effect (car ef*) (Effect* (cdr ef*) live)))))
+    ;; Optional hook: called with the set of locations live *after* a
+    ;; return-point, so callers can accumulate call-live info.
+    (define call-live-hook (if (procedure? call-live!) call-live! (lambda (l) (void))))
     (define Effect
       (lambda (ef live)
         (match ef
           [(nop) live]
           [(if ,p ,c ,a) (Pred p (Effect c live) (Effect a live))]
           [(begin ,ef* ... ,e) (Effect* ef* (Effect e live))]
+          [(return-point ,rp-lab ,tail)
+           (call-live-hook live)
+           ;; the inner tail's live-out is `live` (call-live), which flows
+           ;; around the call to the return point
+           (Tail tail live)]
           [(set! ,lhs ,rhs)
            (let ([live^ (difference live (list lhs))])
              (record-conflict! lhs
@@ -69,14 +78,16 @@
           [(,relop ,x ,y) (guard (relop? relop))
            (union (union t-live f-live) (->set (list x y)))]
           [,x (format-error 'uncover-conflict "invalid Pred ~s" x)])))
+    ;; base is the live-out set (empty for a real tail, call-live for the
+    ;; inner tail of a return-point).
     (define Tail
-      (lambda (t)
+      (lambda (t base)
         (match t
-          [(if ,p ,c ,a) (Pred p (Tail c) (Tail a))]
-          [(begin ,ef* ... ,t) (Effect* ef* (Tail t))]
-          [(,triv ,loc* ...) (->set (cons triv loc*))]
+          [(if ,p ,c ,a) (Pred p (Tail c base) (Tail a base))]
+          [(begin ,ef* ... ,t) (Effect* ef* (Tail t base))]
+          [(,triv ,loc* ...) (union base (->set (cons triv loc*)))]
           [,x (format-error 'uncover-conflict "invalid Tail ~s" x)])))
-    (Tail tail)
+    (Tail tail '())
     ct))
 
 ;; Structured substitution of locations for uvars over a Tail, turning
@@ -94,7 +105,8 @@
            (let ([var^ (v var)] [t^ (v t)])
              (if (equal? var^ t^) '(nop) `(set! ,var^ ,t^)))]
           [(if ,p ,c ,a) `(if ,(Pred p) ,(Effect c) ,(Effect a))]
-          [(begin ,ef* ... ,e) (make-begin `(,@(map Effect ef*) ,(Effect e)))])))
+          [(begin ,ef* ... ,e) (make-begin `(,@(map Effect ef*) ,(Effect e)))]
+          [(return-point ,rp-lab ,tail) `(return-point ,rp-lab ,(Tail tail))])))
     (define Pred
       (lambda (pr)
         (match pr
