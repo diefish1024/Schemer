@@ -12,94 +12,121 @@
 (define relop?
   (lambda (x) (and (memq x '(< <= = >= >)) #t)))
 
-;; keep only the locations we track for liveness: unique vars and registers
-;; (frame variables, ints, and labels are ignored).
-(define track?
-  (lambda (x) (or (uvar? x) (register? x))))
+(define int?
+  (lambda (x) (and (integer? x) (exact? x))))
 
-(define list->set
-  (lambda (ls) (fold-right (lambda (x s) (if (track? x) (set-cons x s) s)) '() ls)))
+;; Backward live analysis that builds a conflict graph.  loc? selects the
+;; fixed locations to track alongside uvars: register? for register
+;; conflicts, frame-var? for frame conflicts.  Returns an assoc list
+;; mapping each uvar to the uvars/locations it conflicts with.
+(define build-conflict-graph
+  (lambda (uvar* tail loc?)
+    (define track? (lambda (x) (or (uvar? x) (loc? x))))
+    (define ->set
+      (lambda (ls) (fold-right (lambda (x s) (if (track? x) (set-cons x s) s)) '() ls)))
+    (define ct (map (lambda (u) (cons u '())) uvar*))
+    (define add-edge!
+      (lambda (a b)                       ; add b into a's list (a is a uvar)
+        (let ([e (assq a ct)]) (set-cdr! e (set-cons b (cdr e))))))
+    (define record-conflict!
+      (lambda (lhs conf*)
+        (for-each
+          (lambda (x)
+            (when (uvar? lhs) (add-edge! lhs x))
+            (when (and (uvar? x) (track? lhs)) (add-edge! x lhs)))
+          conf*)))
+    (define rhs-uses
+      (lambda (rhs)
+        (if (pair? rhs)
+            (match rhs [(,op ,t1 ,t2) (->set (list t1 t2))])
+            (->set (list rhs)))))
+    (define Effect*
+      (lambda (ef* live)
+        (if (null? ef*) live (Effect (car ef*) (Effect* (cdr ef*) live)))))
+    (define Effect
+      (lambda (ef live)
+        (match ef
+          [(nop) live]
+          [(if ,p ,c ,a) (Pred p (Effect c live) (Effect a live))]
+          [(begin ,ef* ... ,e) (Effect* ef* (Effect e live))]
+          [(set! ,lhs ,rhs)
+           (let ([live^ (difference live (list lhs))])
+             (record-conflict! lhs
+               (if (and (not (pair? rhs)) (track? rhs))
+                   (difference live^ (list rhs)) ; move: no self conflict
+                   live^))
+             (union live^ (rhs-uses rhs)))]
+          [,x (format-error 'uncover-conflict "invalid Effect ~s" x)])))
+    (define Pred
+      (lambda (pr t-live f-live)
+        (match pr
+          [(true) t-live]
+          [(false) f-live]
+          [(if ,p ,c ,a) (Pred p (Pred c t-live f-live) (Pred a t-live f-live))]
+          [(begin ,ef* ... ,p) (Effect* ef* (Pred p t-live f-live))]
+          [(,relop ,x ,y) (guard (relop? relop))
+           (union (union t-live f-live) (->set (list x y)))]
+          [,x (format-error 'uncover-conflict "invalid Pred ~s" x)])))
+    (define Tail
+      (lambda (t)
+        (match t
+          [(if ,p ,c ,a) (Pred p (Tail c) (Tail a))]
+          [(begin ,ef* ... ,t) (Effect* ef* (Tail t))]
+          [(,triv ,loc* ...) (->set (cons triv loc*))]
+          [,x (format-error 'uncover-conflict "invalid Tail ~s" x)])))
+    (Tail tail)
+    ct))
+
+;; Structured substitution of locations for uvars over a Tail, turning
+;; any resulting self-move (set! x x) into (nop).  Used by both
+;; finalize-frame-locations (frame homes) and finalize-locations (all).
+(define subst-tail
+  (lambda (env tail)
+    (define v (lambda (x) (cond [(assq x env) => cdr] [else x])))
+    (define Effect
+      (lambda (ef)
+        (match ef
+          [(nop) '(nop)]
+          [(set! ,var (,op ,t1 ,t2)) `(set! ,(v var) (,op ,(v t1) ,(v t2)))]
+          [(set! ,var ,t)
+           (let ([var^ (v var)] [t^ (v t)])
+             (if (equal? var^ t^) '(nop) `(set! ,var^ ,t^)))]
+          [(if ,p ,c ,a) `(if ,(Pred p) ,(Effect c) ,(Effect a))]
+          [(begin ,ef* ... ,e) (make-begin `(,@(map Effect ef*) ,(Effect e)))])))
+    (define Pred
+      (lambda (pr)
+        (match pr
+          [(true) '(true)]
+          [(false) '(false)]
+          [(,relop ,t1 ,t2) (guard (relop? relop)) `(,relop ,(v t1) ,(v t2))]
+          [(if ,p ,c ,a) `(if ,(Pred p) ,(Pred c) ,(Pred a))]
+          [(begin ,ef* ... ,p) (make-begin `(,@(map Effect ef*) ,(Pred p)))])))
+    (define Tail
+      (lambda (t)
+        (match t
+          [(if ,p ,c ,a) `(if ,(Pred p) ,(Tail c) ,(Tail a))]
+          [(begin ,ef* ... ,t) (make-begin `(,@(map Effect ef*) ,(Tail t)))]
+          [(,triv ,loc* ...) `(,(v triv) ,@(map v loc*))])))
+    (Tail tail)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; verify-scheme
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Syntax checking is deferred to a15's parse-scheme (see docs/notice.md),
-;;; so the verifier is the identity pass.
 (define verify-scheme (lambda (program) program))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; uncover-register-conflict  (a4)
+;;; uncover-frame-conflict  (a5)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Backward live analysis over each Body, building a conflict graph that
-;;; maps every uvar to the uvars/registers it cannot share a register
-;;; with.  Emits (locals (uvar*) (register-conflict conflict-graph Tail)).
-(define-who uncover-register-conflict
+;;; Like register conflicts, but tracks frame variables instead of
+;;; registers (all locals pessimistically assumed frame-bound).
+(define-who uncover-frame-conflict
   (lambda (program)
     (define Body
       (lambda (bd)
         (match bd
           [(locals (,uvar* ...) ,tail)
-           (let ([ct (map (lambda (u) (cons u '())) uvar*)])
-             ;; add b into a's conflict entry (a must be a uvar)
-             (define add-edge!
-               (lambda (a b)
-                 (let ([e (assq a ct)])
-                   (set-cdr! e (set-cons b (cdr e))))))
-             ;; record conflicts between lhs (uvar or register) and each
-             ;; live location.  A register lhs still conflicts with the live
-             ;; uvars (they cannot use that register), even though registers
-             ;; keep no conflict list of their own.
-             (define record-conflict!
-               (lambda (lhs conf*)
-                 (for-each
-                   (lambda (x)
-                     (when (uvar? lhs) (add-edge! lhs x))
-                     (when (and (uvar? x) (track? lhs)) (add-edge! x lhs)))
-                   conf*)))
-             (define rhs-uses
-               (lambda (rhs)
-                 (if (pair? rhs)
-                     (match rhs [(,op ,t1 ,t2) (list->set (list t1 t2))])
-                     (list->set (list rhs)))))
-             (define Effect*
-               (lambda (ef* live)
-                 (if (null? ef*)
-                     live
-                     (Effect (car ef*) (Effect* (cdr ef*) live)))))
-             (define Effect
-               (lambda (ef live)
-                 (match ef
-                   [(nop) live]
-                   [(if ,p ,c ,a) (Pred p (Effect c live) (Effect a live))]
-                   [(begin ,ef* ... ,e) (Effect* ef* (Effect e live))]
-                   [(set! ,lhs ,rhs)
-                    (let ([live^ (difference live (list lhs))])
-                      (record-conflict! lhs
-                        (if (and (not (pair? rhs)) (track? rhs))
-                            (difference live^ (list rhs)) ; move: no self conflict
-                            live^))
-                      (union live^ (rhs-uses rhs)))]
-                   [,x (format-error who "invalid Effect ~s" x)])))
-             (define Pred
-               (lambda (pr t-live f-live)
-                 (match pr
-                   [(true) t-live]
-                   [(false) f-live]
-                   [(if ,p ,c ,a)
-                    (Pred p (Pred c t-live f-live) (Pred a t-live f-live))]
-                   [(begin ,ef* ... ,p) (Effect* ef* (Pred p t-live f-live))]
-                   [(,relop ,x ,y) (guard (relop? relop))
-                    (union (union t-live f-live) (list->set (list x y)))]
-                   [,x (format-error who "invalid Pred ~s" x)])))
-             (define Tail
-               (lambda (t)
-                 (match t
-                   [(if ,p ,c ,a) (Pred p (Tail c) (Tail a))]
-                   [(begin ,ef* ... ,t) (Effect* ef* (Tail t))]
-                   [(,triv ,loc* ...) (list->set (cons triv loc*))]
-                   [,x (format-error who "invalid Tail ~s" x)])))
-             (Tail tail)
-             `(locals (,uvar* ...) (register-conflict ,ct ,tail)))]
+           `(locals (,uvar* ...)
+              (frame-conflict ,(build-conflict-graph uvar* tail frame-var?) ,tail))]
           [,x (format-error who "invalid Body ~s" x)])))
     (match program
       [(letrec ([,label (lambda () ,[Body -> body*])] ...) ,[Body -> body])
@@ -107,54 +134,289 @@
       [,x (format-error who "invalid Program ~s" x)])))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; assign-registers  (a4)
+;;; introduce-allocation-forms  (a5)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Optimistic graph-coloring allocator (Briggs).  Repeatedly removes a
-;;; low-degree node, colors the rest, then assigns the node a register
-;;; not used by its neighbors.  a4 never needs to spill, so failure is an
-;;; error.  Produces (locate ([uvar reg]*) Tail).
-(define-who assign-registers
+;;; Wrap each body with empty ulocals and locate forms so later iterations
+;;; have a uniform shape to work with.
+(define-who introduce-allocation-forms
   (lambda (program)
-    (define k (length registers))
-    (define color
-      (lambda (uvar* ct)
-        (define low-degree
-          (lambda (u*)
-            (let loop ([ls u*])
-              (cond
-                [(null? ls) (car u*)]
-                [(< (length (cdr (assq (car ls) ct))) k) (car ls)]
-                [else (loop (cdr ls))]))))
-        (define remove-var
-          (lambda (u ct)
-            (map (lambda (ent) (cons (car ent) (remq u (cdr ent)))) ct)))
-        (define used-regs
-          (lambda (conf* assignments)
-            (let loop ([c conf*])
-              (cond
-                [(null? c) '()]
-                [(register? (car c)) (set-cons (car c) (loop (cdr c)))]
-                [(assq (car c) assignments) =>
-                 (lambda (p) (set-cons (cadr p) (loop (cdr c))))]
-                [else (loop (cdr c))]))))
-        (let rec ([uvar* uvar*] [ct ct])
-          (if (null? uvar*)
-              '()
-              (let* ([u (low-degree uvar*)]
-                     [u-conf (cdr (assq u ct))]
-                     [assignments (rec (remq u uvar*) (remove-var u ct))]
-                     [avail (difference registers (used-regs u-conf assignments))])
-                (if (null? avail)
-                    assignments
-                    (cons (list u (car avail)) assignments)))))))
     (define Body
       (lambda (bd)
         (match bd
-          [(locals (,uvar* ...) (register-conflict ,ct ,tail))
-           (let ([env (color uvar* ct)])
-             (unless (= (length env) (length uvar*))
-               (format-error who "not enough registers (spilling needed)"))
-             `(locate ,env ,tail))]
+          [(locals (,uvar* ...) (frame-conflict ,fcg ,tail))
+           `(locals (,uvar* ...)
+              (ulocals ()
+                (locate ()
+                  (frame-conflict ,fcg ,tail))))]
+          [,x (format-error who "invalid Body ~s" x)])))
+    (match program
+      [(letrec ([,label (lambda () ,[Body -> body*])] ...) ,[Body -> body])
+       `(letrec ([,label (lambda () ,body*)] ...) ,body)]
+      [,x (format-error who "invalid Program ~s" x)])))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; select-instructions  (a5)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Rewrite the code so it obeys x86-64 constraints, introducing
+;;; unspillable temporaries (added to ulocals) where registers are
+;;; required.  uvars are assumed to be register-homed; frame vars are
+;;; memory operands.
+(define-who select-instructions
+  (lambda (program)
+    (define Body
+      (lambda (bd)
+        (match bd
+          [(locate ,home ,tail) bd]     ; complete body, reproduce
+          [(locals (,local* ...)
+             (ulocals (,ulocal* ...)
+               (locate (,fh* ...)
+                 (frame-conflict ,fcg ,tail))))
+           (let ([new-u* '()])
+             (define new-u
+               (lambda ()
+                 (let ([u (unique-name 't)]) (set! new-u* (cons u new-u*)) u)))
+             (define mem? frame-var?)
+             (define commutative? (lambda (op) (memq op '(+ * logand logor))))
+             (define invert
+               (lambda (op) (case op [(<) '>] [(>) '<] [(<=) '>=] [(>=) '<=] [(=) '=])))
+             ;; movq triv -> var
+             (define select-move
+               (lambda (var triv)
+                 (if (and (mem? var)
+                          (or (mem? triv)
+                              (and (int? triv) (not (int32? triv)))
+                              (label? triv)))
+                     (let ([u (new-u)])
+                       (make-begin (list `(set! ,u ,triv) `(set! ,var ,u))))
+                     `(set! ,var ,triv))))
+             ;; produce (set! var (op var t2)) obeying operand constraints
+             (define fix-operand
+               (lambda (var op t2)
+                 (if (or (and (mem? var) (mem? t2))
+                         (and (int? t2) (not (int32? t2)) (not (eq? op 'sra)))
+                         (label? t2))
+                     (let ([u (new-u)])
+                       (make-begin
+                         (list `(set! ,u ,t2) `(set! ,var (,op ,var ,u)))))
+                     `(set! ,var (,op ,var ,t2)))))
+             ;; imulq requires a register destination
+             (define fix-second
+               (lambda (var op t2)
+                 (if (and (eq? op '*) (mem? var))
+                     (let ([u (new-u)])
+                       (make-begin
+                         (list `(set! ,u ,var) (fix-operand u op t2) `(set! ,var ,u))))
+                     (fix-operand var op t2))))
+             (define select-binop
+               (lambda (var op t1 t2)
+                 (cond
+                   [(eq? t1 var) (fix-second var op t2)]
+                   [(and (commutative? op) (eq? t2 var)) (fix-second var op t1)]
+                   [(eq? t2 var)                 ; non-commutative, t2 is var
+                    (let ([u (new-u)])
+                      (make-begin
+                        (list (select-move u t1) (fix-second u op t2) (select-move var u))))]
+                   [else
+                    (make-begin (list (select-move var t1) (fix-second var op t2)))])))
+             (define select-relop
+               (lambda (op t1 t2)
+                 (cond
+                   ;; cmpq's first operand (t1 here) cannot be an immediate
+                   [(and (int? t1) (not (int? t2))) (select-relop (invert op) t2 t1)]
+                   [(int? t1)
+                    (let ([u (new-u)])
+                      (make-begin (list `(set! ,u ,t1) (select-relop op u t2))))]
+                   [(or (and (mem? t1) (mem? t2))
+                        (and (int? t2) (not (int32? t2)))
+                        (label? t2))
+                    (let ([u (new-u)])
+                      (make-begin (list `(set! ,u ,t2) `(,op ,t1 ,u))))]
+                   [else `(,op ,t1 ,t2)])))
+             (define Effect
+               (lambda (ef)
+                 (match ef
+                   [(nop) '(nop)]
+                   [(set! ,var (,op ,t1 ,t2)) (select-binop var op t1 t2)]
+                   [(set! ,var ,t) (select-move var t)]
+                   [(if ,p ,c ,a) `(if ,(Pred p) ,(Effect c) ,(Effect a))]
+                   [(begin ,ef* ... ,e) (make-begin `(,@(map Effect ef*) ,(Effect e)))])))
+             (define Pred
+               (lambda (pr)
+                 (match pr
+                   [(true) '(true)]
+                   [(false) '(false)]
+                   [(if ,p ,c ,a) `(if ,(Pred p) ,(Pred c) ,(Pred a))]
+                   [(begin ,ef* ... ,p) (make-begin `(,@(map Effect ef*) ,(Pred p)))]
+                   [(,relop ,t1 ,t2) (guard (relop? relop)) (select-relop relop t1 t2)])))
+             (define Tail
+               (lambda (t)
+                 (match t
+                   [(if ,p ,c ,a) `(if ,(Pred p) ,(Tail c) ,(Tail a))]
+                   [(begin ,ef* ... ,tl) (make-begin `(,@(map Effect ef*) ,(Tail tl)))]
+                   [(,triv ,loc* ...) `(,triv ,@loc*)])))
+             (let ([tail^ (Tail tail)])
+               `(locals (,local* ...)
+                  (ulocals (,@new-u* ,@ulocal*)
+                    (locate (,fh* ...)
+                      (frame-conflict ,fcg ,tail^))))))]
+          [,x (format-error who "invalid Body ~s" x)])))
+    (match program
+      [(letrec ([,label (lambda () ,[Body -> body*])] ...) ,[Body -> body])
+       `(letrec ([,label (lambda () ,body*)] ...) ,body)]
+      [,x (format-error who "invalid Program ~s" x)])))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; uncover-register-conflict  (a4, extended in a5)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(define-who uncover-register-conflict
+  (lambda (program)
+    (define Body
+      (lambda (bd)
+        (match bd
+          [(locate ,home ,tail) bd]     ; complete body, reproduce
+          [(locals (,local* ...)
+             (ulocals (,ulocal* ...)
+               (locate (,fh* ...)
+                 (frame-conflict ,fcg ,tail))))
+           (let ([ct (build-conflict-graph (append local* ulocal*) tail register?)])
+             `(locals (,local* ...)
+                (ulocals (,ulocal* ...)
+                  (locate (,fh* ...)
+                    (frame-conflict ,fcg
+                      (register-conflict ,ct ,tail))))))]
+          [,x (format-error who "invalid Body ~s" x)])))
+    (match program
+      [(letrec ([,label (lambda () ,[Body -> body*])] ...) ,[Body -> body])
+       `(letrec ([,label (lambda () ,body*)] ...) ,body)]
+      [,x (format-error who "invalid Program ~s" x)])))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; assign-registers  (a4, extended in a5 with spilling)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(define-who assign-registers
+  (lambda (program)
+    (define k (length registers))
+    ;; returns (values assignments spills); unspillables must get a register
+    (define color
+      (lambda (spillable* unspillable* ct)
+        (define spillable? (lambda (u) (memq u spillable*)))
+        (define remove-var
+          (lambda (u ct) (map (lambda (e) (cons (car e) (remq u (cdr e)))) ct)))
+        (define used
+          (lambda (conf assignments)
+            (fold-right
+              (lambda (x acc)
+                (cond
+                  [(register? x) (set-cons x acc)]
+                  [(assq x assignments) => (lambda (p) (set-cons (cadr p) acc))]
+                  [else acc]))
+              '() conf)))
+        (define pick
+          (lambda (uvar* ct)
+            (or (find (lambda (u) (< (length (cdr (assq u ct))) k)) uvar*)
+                (find spillable? uvar*)
+                (car uvar*))))
+        (let rec ([uvar* (append unspillable* spillable*)] [ct ct])
+          (if (null? uvar*)
+              (values '() '())
+              (let* ([u (pick uvar* ct)]
+                     [u-conf (cdr (assq u ct))])
+                (let-values ([(assignments spills) (rec (remq u uvar*) (remove-var u ct))])
+                  (let ([avail (difference registers (used u-conf assignments))])
+                    (cond
+                      [(pair? avail) (values (cons (list u (car avail)) assignments) spills)]
+                      [(spillable? u) (values assignments (cons u spills))]
+                      [else (format-error who "no register for unspillable ~s" u)]))))))))
+    (define Body
+      (lambda (bd)
+        (match bd
+          [(locate ,home ,tail) bd]     ; complete body, reproduce
+          [(locals (,local* ...)
+             (ulocals (,ulocal* ...)
+               (locate (,fh* ...)
+                 (frame-conflict ,fcg
+                   (register-conflict ,rcg ,tail)))))
+           (let-values ([(assignments spills) (color local* ulocal* rcg)])
+             (if (null? spills)
+                 `(locate ,(append fh* assignments) ,tail)
+                 `(locals ,(difference local* spills)
+                    (ulocals (,ulocal* ...)
+                      (spills ,spills
+                        (locate (,fh* ...)
+                          (frame-conflict ,fcg ,tail)))))))]
+          [,x (format-error who "invalid Body ~s" x)])))
+    (match program
+      [(letrec ([,label (lambda () ,[Body -> body*])] ...) ,[Body -> body])
+       `(letrec ([,label (lambda () ,body*)] ...) ,body)]
+      [,x (format-error who "invalid Program ~s" x)])))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; assign-frame  (a5)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Give each spilled variable a frame home compatible with the frame
+;;; conflict graph and the homes already assigned this run.
+(define-who assign-frame
+  (lambda (program)
+    (define first-free
+      (lambda (used)
+        (let loop ([i 0])
+          (let ([fv (index->frame-var i)])
+            (if (memq fv used) (loop (+ i 1)) fv)))))
+    (define assign-spills
+      (lambda (spill* fcg home*)
+        (if (null? spill* )
+            home*
+            (let* ([x (car spill*)]
+                   [conf (cond [(assq x fcg) => cdr] [else '()])]
+                   [used (fold-right
+                           (lambda (c acc)
+                             (cond
+                               [(frame-var? c) (set-cons c acc)]
+                               [(assq c home*) => (lambda (p) (set-cons (cadr p) acc))]
+                               [else acc]))
+                           '() conf)])
+              (assign-spills (cdr spill*) fcg
+                (cons (list x (first-free used)) home*))))))
+    (define Body
+      (lambda (bd)
+        (match bd
+          [(locate ,home ,tail) bd]     ; complete body, reproduce
+          [(locals (,local* ...)
+             (ulocals (,ulocal* ...)
+               (spills (,spill* ...)
+                 (locate (,fh* ...)
+                   (frame-conflict ,fcg ,tail)))))
+           `(locals (,local* ...)
+              (ulocals (,ulocal* ...)
+                (locate ,(assign-spills spill* fcg fh*)
+                  (frame-conflict ,fcg ,tail))))]
+          [,x (format-error who "invalid Body ~s" x)])))
+    (match program
+      [(letrec ([,label (lambda () ,[Body -> body*])] ...) ,[Body -> body])
+       `(letrec ([,label (lambda () ,body*)] ...) ,body)]
+      [,x (format-error who "invalid Program ~s" x)])))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; finalize-frame-locations  (a5)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Substitute frame-allocated uvars with their frame vars, keeping the
+;;; locate form (its homes are needed by the next iteration).
+(define-who finalize-frame-locations
+  (lambda (program)
+    (define frame-env
+      (lambda (home*)
+        (fold-right
+          (lambda (b acc) (if (frame-var? (cadr b)) (cons (cons (car b) (cadr b)) acc) acc))
+          '() home*)))
+    (define Body
+      (lambda (bd)
+        (match bd
+          [(locals ,l (ulocals ,u (locate (,home* ...) (frame-conflict ,fcg ,tail))))
+           `(locals ,l (ulocals ,u
+              (locate (,home* ...)
+                (frame-conflict ,fcg ,(subst-tail (frame-env home*) tail)))))]
+          [(locate (,home* ...) ,tail)
+           `(locate (,home* ...) ,(subst-tail (frame-env home*) tail))]
           [,x (format-error who "invalid Body ~s" x)])))
     (match program
       [(letrec ([,label (lambda () ,[Body -> body*])] ...) ,[Body -> body])
@@ -164,8 +426,6 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; discard-call-live  (a4)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Drop the Loc* live list attached to each tail call; only Tail context
-;;; needs traversal since calls appear only there.
 (define-who discard-call-live
   (lambda (program)
     (define Tail
@@ -186,22 +446,15 @@
       [,x (format-error who "invalid Program ~s" x)])))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; finalize-locations  (a3)
+;;; finalize-locations  (a3, extended in a5 with self-move -> nop)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Each Body is (locate ([uvar Loc]*) Tail).  Replace every uvar in the
-;;; Tail with its assigned Loc and drop the locate form.
 (define-who finalize-locations
   (lambda (program)
     (define Body
       (lambda (bd)
         (match bd
           [(locate ([,uvar* ,loc*] ...) ,tail)
-           (let ([env (map cons uvar* loc*)])
-             (let sub ([x tail])
-               (cond
-                 [(uvar? x) (cond [(assq x env) => cdr] [else x])]
-                 [(pair? x) (cons (sub (car x)) (sub (cdr x)))]
-                 [else x])))]
+           (subst-tail (map cons uvar* loc*) tail)]
           [,x (format-error who "invalid Body ~s" x)])))
     (match program
       [(letrec ([,label (lambda () ,[Body -> body*])] ...) ,[Body -> body])
@@ -211,8 +464,6 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; expose-frame-var  (a2, generalized in a3)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Replace each frame variable fvN with a displacement operand
-;;; #<disp rbp 8N>, as a grammar-independent tree walk.
 (define-who expose-frame-var
   (lambda (program)
     (let walk ([x program])
@@ -225,9 +476,6 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; expose-basic-blocks  (a3)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Flatten nested if/begin into basic blocks.  Helpers return (values
-;;; expr new-bindings); the only surviving conditional is
-;;; (if (relop Triv Triv) (clab) (alab)) in tail position.
 (define-who expose-basic-blocks
   (lambda (program)
     (define Tail
@@ -313,8 +561,6 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; flatten-program  (a2 + a3)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
-;;; Flatten into a single (code ...) form.  Conditional jumps use the
-;;; label of the *next* letrec binding to avoid redundant jumps.
 (define-who flatten-program
   (lambda (program)
     (define Tail
@@ -352,7 +598,6 @@
         [(+) 'addq]   [(-) 'subq]  [(*) 'imulq]
         [(logand) 'andq] [(logor) 'orq] [(sra) 'sarq]
         [else (format-error who "unexpected binop ~s" op)])))
-  ;; cmpq t2, t1 computes t1 - t2, so the cc names t1 <relop> t2.
   (define relop->cc
     (lambda (op)
       (case op
