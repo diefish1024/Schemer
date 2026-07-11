@@ -226,6 +226,51 @@
       [,x (format-error who "invalid Program ~s" x)])))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; optimize-jumps  (a11)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; expose-basic-blocks leaves behind blocks whose whole body is a jump
+;;; to another label.  Drop those blocks and redirect every jump to its
+;;; ultimate target.  resolve follows the chain; a jump cycle (an
+;;; infinite loop) resolves each member to itself, so at least one block
+;;; survives -- we only drop a block when its target differs from itself.
+(define-who optimize-jumps
+  (lambda (program)
+    (match program
+      [(letrec ([,label (lambda () ,tail)] ...) ,body)
+       ;; map from each trivial-jump label to its immediate target label
+       (define jump-of
+         (lambda (t) (match t [(,x) (guard (label? x)) x] [,other #f])))
+       (define alist
+         (fold-right
+           (lambda (l t acc)
+             (let ([tgt (jump-of t)]) (if tgt (cons (cons l tgt) acc) acc)))
+           '() label tail))
+       (define resolve
+         (lambda (x)
+           (let loop ([x x] [seen '()])
+             (cond
+               [(memq x seen) x]                    ; cycle: stop here
+               [(assq x alist) => (lambda (p) (loop (cdr p) (cons x seen)))]
+               [else x]))))
+       (define Tail
+         (lambda (t)
+           (match t
+             [(begin ,ef* ... ,[Tail -> tail]) (make-begin `(,@ef* ,tail))]
+             [(if ,pred (,c) (,a)) `(if ,pred (,(resolve c)) (,(resolve a)))]
+             [(,triv) `(,(resolve triv))])))
+       ;; keep a block unless it is a trivial jump that resolves elsewhere
+       (let loop ([l* label] [t* tail] [kl '()] [kt '()])
+         (if (null? l*)
+             `(letrec ,(map (lambda (l t) `[,l (lambda () ,(Tail t))])
+                            (reverse kl) (reverse kt))
+                ,(Tail body))
+             (let ([l (car l*)] [t (car t*)])
+               (if (and (jump-of t) (not (eq? (resolve l) l)))
+                   (loop (cdr l*) (cdr t*) kl kt)                 ; drop
+                   (loop (cdr l*) (cdr t*) (cons l kl) (cons t kt))))))]
+      [,x (format-error who "invalid Program ~s" x)])))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; flatten-program  (a2 + a3)
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Flatten into a single (code ...) form.  Conditional jumps use the

@@ -4,6 +4,95 @@
 ;;;   a6:  remove-complex-opera*  flatten-set!  impose-calling-conventions
 ;;;   a9:  uncover-locals  remove-let  (the first language-dependent passes)
 ;;;   a10: specify-representation  (Scheme datatypes/prims -> UIL ptrs)
+;;;   a11: lift-letrec  normalize-context  (letrec anywhere; context split)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; lift-letrec  (a11)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; letrec may now appear anywhere.  Since labels are globally unique and
+;;; lambdas have no free uvars, we can hoist every letrec's bindings into
+;;; a single top-level letrec and drop the internal letrec forms.  One
+;;; grammar-independent walk collects bindings (recurring into each
+;;; lambda body and rhs) and returns the letrec-free expression.
+(define-who lift-letrec
+  (lambda (program)
+    (define binding* '())
+    (define lift
+      (lambda (x)
+        (match x
+          [(letrec ([,label (lambda (,fml* ...) ,[lift -> body*])] ...) ,[lift -> e])
+           (for-each
+             (lambda (l f b) (set! binding* (cons `[,l (lambda ,f ,b)] binding*)))
+             label fml* body*)
+           e]
+          [(,[lift -> a] . ,[lift -> d]) (cons a d)]
+          [,atom atom])))
+    (let ([e (lift program)])
+      `(letrec ,(reverse binding*) ,e))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; normalize-context  (a11)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Every expr may appear in value / predicate / effect context on input;
+;;; split them so each prim call and constant lands only where it is
+;;; legal, matching the a10 source grammar.  Three mutually-recursive
+;;; handlers, one per context.
+(define-who normalize-context
+  (lambda (program)
+    (define make-nopless-begin
+      (lambda (x*)
+        (let ([x* (remove '(nop) x*)])
+          (if (null? x*) '(nop) (make-begin x*)))))
+    (define Value
+      (lambda (e)
+        (match e
+          [,lbl (guard (label? lbl)) lbl]
+          [,u (guard (uvar? u)) u]
+          [(quote ,i) `(quote ,i)]
+          [(if ,[Pred -> p] ,[Value -> c] ,[Value -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Effect -> e*] ... ,[Value -> v]) (make-nopless-begin `(,@e* ,v))]
+          [(let ([,u* ,[Value -> r*]] ...) ,[Value -> body])
+           `(let ([,u* ,r*] ...) ,body)]
+          [(,p ,[Value -> a*] ...) (guard (value-prim? p)) `(,p ,@a*)]
+          ;; a predicate prim in value context: compute its boolean
+          [(,p ,a* ...) (guard (pred-prim? p))
+           `(if ,(Pred e) (quote #t) (quote #f))]
+          ;; an effect prim in value context: run it, yield void
+          [(,p ,a* ...) (guard (effect-prim? p)) (make-begin (list (Effect e) '(void)))]
+          [(,[Value -> rator] ,[Value -> rand*] ...) `(,rator ,@rand*)])))
+    (define Pred
+      (lambda (e)
+        (match e
+          [,lbl (guard (label? lbl)) `(if (eq? ,lbl (quote #f)) (false) (true))]
+          [,u (guard (uvar? u)) `(if (eq? ,u (quote #f)) (false) (true))]
+          [(quote ,i) (if (eq? i #f) '(false) '(true))]
+          [(if ,[Pred -> p] ,[Pred -> c] ,[Pred -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Effect -> e*] ... ,[Pred -> p]) (make-nopless-begin `(,@e* ,p))]
+          [(let ([,u* ,[Value -> r*]] ...) ,[Pred -> body])
+           `(let ([,u* ,r*] ...) ,body)]
+          [(,p ,[Value -> a*] ...) (guard (pred-prim? p)) `(,p ,@a*)]
+          ;; a value prim or a call in predicate context: test for #f
+          [,other `(if (eq? ,(Value other) (quote #f)) (false) (true))])))
+    (define Effect
+      (lambda (e)
+        (match e
+          [,lbl (guard (label? lbl)) '(nop)]
+          [,u (guard (uvar? u)) '(nop)]
+          [(quote ,i) '(nop)]
+          [(if ,[Pred -> p] ,[Effect -> c] ,[Effect -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Effect -> e*] ... ,[Effect -> e]) (make-nopless-begin `(,@e* ,e))]
+          [(let ([,u* ,[Value -> r*]] ...) ,[Effect -> body])
+           `(let ([,u* ,r*] ...) ,body)]
+          [(,p ,[Value -> a*] ...) (guard (effect-prim? p)) `(,p ,@a*)]
+          ;; value/pred prim in effect context: drop the call, keep the
+          ;; operands' effects (each processed in effect context).
+          [(,p ,a* ...) (guard (or (value-prim? p) (pred-prim? p)))
+           (make-nopless-begin (map Effect a*))]
+          [(,[Value -> rator] ,[Value -> rand*] ...) `(,rator ,@rand*)])))
+    (match program
+      [(letrec ([,label (lambda (,fml* ...) ,[Value -> body*])] ...) ,[Value -> body])
+       `(letrec ([,label (lambda (,fml* ...) ,body*)] ...) ,body)]
+      [,x (format-error who "invalid Program ~s" x)])))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; specify-representation  (a10)
@@ -20,16 +109,6 @@
     (define offset-cdr (- disp-cdr tag-pair))
     (define offset-vector-length (- disp-vector-length tag-vector))
     (define offset-vector-data (- disp-vector-data tag-vector))
-    (define value-prim?
-      (lambda (x)
-        (and (memq x '(+ - * car cdr cons make-vector vector-length
-                         vector-ref void)) #t)))
-    (define pred-prim?
-      (lambda (x)
-        (and (memq x '(< <= = >= > boolean? eq? fixnum? null? pair?
-                         vector?)) #t)))
-    (define effect-prim?
-      (lambda (x) (and (memq x '(set-car! set-cdr! vector-set!)) #t)))
     ;; a quoted/immediate constant, already specified, is a bare integer
     (define Immediate
       (lambda (i)
