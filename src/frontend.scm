@@ -2,6 +2,49 @@
 ;;; Front-end passes that lower the higher-level UIL toward the register/
 ;;; frame allocation cluster.  Added incrementally from a6 onward:
 ;;;   a6: remove-complex-opera*  flatten-set!  impose-calling-conventions
+;;;   a9: uncover-locals  remove-let  (the first language-dependent passes)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; uncover-locals  (a9)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; The source language binds locals with let instead of a locals form.
+;;; Collect every let-bound uvar in each lambda/letrec body and wrap the
+;;; body in (locals (uvar*) Tail).  Lambda parameters are not locals, so
+;;; only let left-hand sides are gathered.  Since bodies contain no
+;;; nested lambdas, a single grammar-independent walk suffices.
+(define-who uncover-locals
+  (lambda (program)
+    (define collect
+      (lambda (x)
+        (match x
+          [(let ([,u* ,[collect -> r*]] ...) ,[collect -> b])
+           (union u* (fold-right union b r*))]
+          [(,[collect -> a] . ,[collect -> d]) (union a d)]
+          [,atom '()])))
+    (define Body (lambda (body) `(locals ,(collect body) ,body)))
+    (match program
+      [(letrec ([,label (lambda (,fml* ...) ,[Body -> body*])] ...) ,[Body -> body])
+       `(letrec ([,label (lambda (,fml* ...) ,body*)] ...) ,body)]
+      [,x (format-error who "invalid Program ~s" x)])))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; remove-let  (a9)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Replace each let with set!s over its now-declared locals:
+;;;   (let ([x e] ...) body) => (begin (set! x e) ... body)
+;;; A begin is legal in every context a let could appear (Tail, Pred,
+;;; Effect, Value), so a uniform tree walk handles them all; make-begin
+;;; keeps the result flat.
+(define-who remove-let
+  (lambda (program)
+    (define rem
+      (lambda (x)
+        (match x
+          [(let ([,u* ,[rem -> e*]] ...) ,[rem -> body])
+           (make-begin `(,@(map (lambda (u e) `(set! ,u ,e)) u* e*) ,body))]
+          [(,[rem -> a] . ,[rem -> d]) (cons a d)]
+          [,atom atom])))
+    (rem program)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; remove-complex-opera*  (a6)
