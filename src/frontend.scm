@@ -5,6 +5,150 @@
 ;;;   a9:  uncover-locals  remove-let  (the first language-dependent passes)
 ;;;   a10: specify-representation  (Scheme datatypes/prims -> UIL ptrs)
 ;;;   a11: lift-letrec  normalize-context  (letrec anywhere; context split)
+;;;   a12: uncover-free  convert-closures  introduce-procedure-primitives
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; uncover-free  (a12)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Wrap each lambda body in (free (uvar*) body), listing the variables
+;;; that occur free in it.  Expr returns (values expr^ free*); the free
+;;; set of a lambda body (minus its formals) is what gets recorded, and
+;;; the procedure name stays free in its own body (recursion) because it
+;;; is only removed at the enclosing letrec.
+(define-who uncover-free
+  (lambda (program)
+    (define Expr
+      (lambda (e)
+        (match e
+          [,u (guard (uvar? u)) (values u (list u))]
+          [(quote ,i) (values `(quote ,i) '())]
+          [(if ,[Expr -> p pf] ,[Expr -> c cf] ,[Expr -> a af])
+           (values `(if ,p ,c ,a) (union pf cf af))]
+          [(begin ,[Expr -> e* ef*] ... ,[Expr -> t tf])
+           (values (make-begin `(,@e* ,t)) (apply union tf ef*))]
+          [(let ([,u* ,[Expr -> r* rf*]] ...) ,[Expr -> body bf])
+           (values `(let ([,u* ,r*] ...) ,body)
+                   (union (apply union rf*) (difference bf u*)))]
+          [(letrec ([,name* (lambda (,fml** ...) ,[Expr -> lbody* lbf*])] ...)
+             ,[Expr -> body bf])
+           ;; each lambda records its own free set (body free minus formals)
+           (let* ([lfree* (map difference lbf* fml**)]
+                  [lam* (map (lambda (fml lfree lbody)
+                               `(lambda ,fml (free ,lfree ,lbody)))
+                             fml** lfree* lbody*)]
+                  ;; free of the whole letrec: bodies' + body's free, minus names
+                  [all (difference (apply union bf lfree*) name*)])
+             (values `(letrec ([,name* ,lam*] ...) ,body) all))]
+          [(,p ,[Expr -> a* af*] ...) (guard (prim? p))
+           (values `(,p ,@a*) (apply union '() af*))]
+          [(,[Expr -> rator rf] ,[Expr -> rand* randf*] ...)
+           (values `(,rator ,@rand*) (apply union rf randf*))])))
+    (let-values ([(e _) (Expr program)]) e)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; convert-closures  (a12)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Turn each letrec-bound procedure into an explicit closure.  Each
+;;; lambda gains a leading closure-pointer parameter cp; (free f*) becomes
+;;; (bind-free (cp f*)); the letrec body is wrapped in (closures ([name
+;;; label free*] ...) body); every call passes the operator as its own
+;;; first argument.  letrec names become labels.
+(define-who convert-closures
+  (lambda (program)
+    (define Expr
+      (lambda (e)
+        (match e
+          [,u (guard (uvar? u)) u]
+          [(quote ,i) `(quote ,i)]
+          [(if ,[Expr -> p] ,[Expr -> c] ,[Expr -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Expr -> e*] ... ,[Expr -> t]) (make-begin `(,@e* ,t))]
+          [(let ([,u* ,[Expr -> r*]] ...) ,[Expr -> body])
+           `(let ([,u* ,r*] ...) ,body)]
+          [(letrec ([,name* (lambda (,fml** ...)
+                              (free (,free** ...) ,[Expr -> lbody*]))] ...)
+             ,[Expr -> body])
+           (let ([label* (map unique-label name*)]
+                 [cp* (map (lambda (_) (unique-name 'cp)) name*)])
+             `(letrec ([,label* (lambda (,cp* ,fml** ...)
+                                  (bind-free (,cp* ,free** ...) ,lbody*))] ...)
+                (closures ([,name* ,label* ,free** ...] ...) ,body)))]
+          [(,p ,[Expr -> a*] ...) (guard (prim? p)) `(,p ,@a*)]
+          ;; a procedure call passes the operator as its own first
+          ;; argument.  A non-variable operator must be evaluated once, so
+          ;; bind it to a temp rather than duplicating the expression.
+          [(,[Expr -> rator] ,[Expr -> rand*] ...)
+           (if (uvar? rator)
+               `(,rator ,rator ,@rand*)
+               (let ([t (unique-name 'tmp)])
+                 `(let ([,t ,rator]) (,t ,t ,@rand*))))])))
+    (Expr program)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; introduce-procedure-primitives  (a12)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Make closure operations explicit.  Free-variable references inside a
+;;; procedure become (procedure-ref cp n); (closures ...) becomes
+;;; make-procedure allocations followed by procedure-set! fills; a call
+;;; wraps its operator in (procedure-code op) unless it is already a
+;;; label.  bind-free is dropped after recording the cp->free mapping.
+(define-who introduce-procedure-primitives
+  (lambda (program)
+    ;; index of free var f within cp's free list -> (procedure-ref cp n)
+    (define ref-of
+      (lambda (cp free*)
+        (lambda (f)
+          (let loop ([f* free*] [n 0])
+            (cond
+              [(null? f*) f]                     ; not free here: leave as is
+              [(eq? (car f*) f) `(procedure-ref ,cp (quote ,n))]
+              [else (loop (cdr f*) (+ n 1))])))))
+    (define Expr
+      (lambda (ref)
+        (lambda (e)
+          (match e
+            [,u (guard (uvar? u)) (ref u)]
+            [,l (guard (label? l)) l]
+            [(quote ,i) `(quote ,i)]
+            [(if ,[(Expr ref) -> p] ,[(Expr ref) -> c] ,[(Expr ref) -> a])
+             `(if ,p ,c ,a)]
+            [(begin ,[(Expr ref) -> e*] ... ,[(Expr ref) -> t])
+             (make-begin `(,@e* ,t))]
+            [(let ([,u* ,[(Expr ref) -> r*]] ...) ,[(Expr ref) -> body])
+             `(let ([,u* ,r*] ...) ,body)]
+            [(letrec ([,label* (lambda (,cp* ,fml** ...)
+                                 (bind-free (,cp2* ,free** ...) ,lbody*))] ...)
+               ,[(Expr ref) -> body])
+             (let ([lam* (map (lambda (cp fml free lbody)
+                                `(lambda (,cp ,@fml)
+                                   ,((Expr (ref-of cp free)) lbody)))
+                              cp* fml** free** lbody*)])
+               `(letrec ([,label* ,lam*] ...) ,body))]
+            [(closures ([,name* ,clabel* ,cfree** ...] ...) ,[(Expr ref) -> body])
+             ;; allocate each closure, then fill in its free-var slots
+             (let ([bind* (map (lambda (name clabel free*)
+                                 `[,name (make-procedure ,clabel
+                                           (quote ,(length free*)))])
+                               name* clabel* cfree**)]
+                   [set*
+                     (apply append
+                       (map (lambda (name free*)
+                              (let loop ([f* free*] [n 0] [acc '()])
+                                (if (null? f*)
+                                    (reverse acc)
+                                    (loop (cdr f*) (+ n 1)
+                                      (cons `(procedure-set! ,name (quote ,n)
+                                               ,(ref (car f*)))
+                                            acc)))))
+                            name* cfree**))])
+               `(let ,bind* ,(make-begin `(,@set* ,body))))]
+            [(,p ,[(Expr ref) -> a*] ...) (guard (prim? p)) `(,p ,@a*)]
+            ;; a call: (op op args...) -> ((procedure-code op) op args...)
+            ;; unless op is a label already (it never is at this point)
+            [(,[(Expr ref) -> rator] ,[(Expr ref) -> rand*] ...)
+             (if (label? rator)
+                 `(,rator ,@rand*)
+                 `((procedure-code ,rator) ,@rand*))]))))
+    ((Expr (lambda (u) u)) program)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; lift-letrec  (a11)
@@ -109,6 +253,8 @@
     (define offset-cdr (- disp-cdr tag-pair))
     (define offset-vector-length (- disp-vector-length tag-vector))
     (define offset-vector-data (- disp-vector-data tag-vector))
+    (define offset-procedure-code (- disp-procedure-code tag-procedure))
+    (define offset-procedure-data (- disp-procedure-data tag-procedure))
     ;; a quoted/immediate constant, already specified, is a bare integer
     (define Immediate
       (lambda (i)
@@ -151,6 +297,13 @@
                 `(let ([,ts ,size])
                    (let ([,tp (+ (alloc (+ ,disp-vector-data ,ts)) ,tag-vector)])
                      (begin (mset! ,tp ,offset-vector-length ,ts) ,tp))))))))
+    ;; a closure: code slot at offset-procedure-code, then n free-var
+    ;; slots.  The count n arrives as a specified fixnum ptr (8n bytes).
+    (define make-procedure-form
+      (lambda (label n)
+        (let ([tp (unique-name 'tmp)])
+          `(let ([,tp (+ (alloc ,(+ disp-procedure-data n)) ,tag-procedure)])
+             (begin (mset! ,tp ,offset-procedure-code ,label) ,tp)))))
     (define value-prim
       (lambda (p a*)
         (case p
@@ -162,7 +315,11 @@
           [(make-vector) (make-vector-form (car a*))]
           [(vector-length) `(mref ,(car a*) ,offset-vector-length)]
           [(vector-ref) `(mref ,(car a*) ,(idx+ offset-vector-data (cadr a*)))]
-          [(void) $void])))
+          [(void) $void]
+          [(make-procedure) (make-procedure-form (car a*) (cadr a*))]
+          [(procedure-code) `(mref ,(car a*) ,offset-procedure-code)]
+          [(procedure-ref)
+           `(mref ,(car a*) ,(idx+ offset-procedure-data (cadr a*)))])))
     (define pred-prim
       (lambda (p a*)
         (case p
@@ -172,14 +329,17 @@
           [(pair?) `(= (logand ,(car a*) ,mask-pair) ,tag-pair)]
           [(vector?) `(= (logand ,(car a*) ,mask-vector) ,tag-vector)]
           [(fixnum?) `(= (logand ,(car a*) ,mask-fixnum) ,tag-fixnum)]
-          [(boolean?) `(= (logand ,(car a*) ,mask-boolean) ,tag-boolean)])))
+          [(boolean?) `(= (logand ,(car a*) ,mask-boolean) ,tag-boolean)]
+          [(procedure?) `(= (logand ,(car a*) ,mask-procedure) ,tag-procedure)])))
     (define effect-prim
       (lambda (p a*)
         (case p
           [(set-car!) `(mset! ,(car a*) ,offset-car ,(cadr a*))]
           [(set-cdr!) `(mset! ,(car a*) ,offset-cdr ,(cadr a*))]
           [(vector-set!)
-           `(mset! ,(car a*) ,(idx+ offset-vector-data (cadr a*)) ,(caddr a*))])))
+           `(mset! ,(car a*) ,(idx+ offset-vector-data (cadr a*)) ,(caddr a*))]
+          [(procedure-set!)
+           `(mset! ,(car a*) ,(idx+ offset-procedure-data (cadr a*)) ,(caddr a*))])))
     (define Value
       (lambda (v)
         (match v

@@ -12,17 +12,21 @@
   (lambda (x) (and (memq x '(+ - * logand logor sra)) #t)))
 
 ;; Scheme-primitive categories (shared by normalize-context a11 and
-;; specify-representation a10).  Each prim belongs to exactly one.
+;; specify-representation a10).  Each prim belongs to exactly one.  The
+;; procedure-* prims (a12) are compiler-internal, added after closure
+;; conversion introduces them.
 (define value-prim?
   (lambda (x)
     (and (memq x '(+ - * car cdr cons make-vector vector-length
-                     vector-ref void)) #t)))
+                     vector-ref void
+                     make-procedure procedure-ref procedure-code)) #t)))
 (define pred-prim?
   (lambda (x)
     (and (memq x '(< <= = >= > boolean? eq? fixnum? null? pair?
-                     vector?)) #t)))
+                     vector? procedure?)) #t)))
 (define effect-prim?
-  (lambda (x) (and (memq x '(set-car! set-cdr! vector-set!)) #t)))
+  (lambda (x) (and (memq x '(set-car! set-cdr! vector-set!
+                              procedure-set!)) #t)))
 (define prim?
   (lambda (x) (or (value-prim? x) (pred-prim? x) (effect-prim? x))))
 
