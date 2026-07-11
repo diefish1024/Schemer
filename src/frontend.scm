@@ -1,8 +1,142 @@
 ;;; frontend.scm
 ;;; Front-end passes that lower the higher-level UIL toward the register/
 ;;; frame allocation cluster.  Added incrementally from a6 onward:
-;;;   a6: remove-complex-opera*  flatten-set!  impose-calling-conventions
-;;;   a9: uncover-locals  remove-let  (the first language-dependent passes)
+;;;   a6:  remove-complex-opera*  flatten-set!  impose-calling-conventions
+;;;   a9:  uncover-locals  remove-let  (the first language-dependent passes)
+;;;   a10: specify-representation  (Scheme datatypes/prims -> UIL ptrs)
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; specify-representation  (a10)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Convert Scheme datatypes to their tagged ptr integers and Scheme
+;;; primitives to UIL primitives (alloc / mref / mset! / binops).  All
+;;; tag/mask/disp constants come from helpers.scm -- never hard-coded --
+;;; so alternative tag assignments keep working.  Runs before
+;;; uncover-locals, so freshly introduced lets need no special handling.
+(define-who specify-representation
+  (lambda (program)
+    ;; byte offsets from a tagged ptr to each field
+    (define offset-car (- disp-car tag-pair))
+    (define offset-cdr (- disp-cdr tag-pair))
+    (define offset-vector-length (- disp-vector-length tag-vector))
+    (define offset-vector-data (- disp-vector-data tag-vector))
+    (define value-prim?
+      (lambda (x)
+        (and (memq x '(+ - * car cdr cons make-vector vector-length
+                         vector-ref void)) #t)))
+    (define pred-prim?
+      (lambda (x)
+        (and (memq x '(< <= = >= > boolean? eq? fixnum? null? pair?
+                         vector?)) #t)))
+    (define effect-prim?
+      (lambda (x) (and (memq x '(set-car! set-cdr! vector-set!)) #t)))
+    ;; a quoted/immediate constant, already specified, is a bare integer
+    (define Immediate
+      (lambda (i)
+        (cond
+          [(eq? i #t) $true]
+          [(eq? i #f) $false]
+          [(null? i) $nil]
+          [(and (integer? i) (exact? i)) (ash i shift-fixnum)]
+          [else (format-error who "invalid immediate ~s" i)])))
+    ;; add a (possibly constant) byte index to a base offset, folding at
+    ;; compile time when the index is a specified constant (a number).
+    (define idx+
+      (lambda (base idx)
+        (if (number? idx) (+ base idx) `(+ ,base ,idx))))
+    ;; (* 8a 8b) must yield 8ab, so one operand is shifted back down by
+    ;; shift-fixnum -- at compile time when that operand is constant.
+    (define mult
+      (lambda (x y)
+        (cond
+          [(number? x) `(* ,(sra x shift-fixnum) ,y)]
+          [(number? y) `(* ,x ,(sra y shift-fixnum))]
+          [else `(* ,x (sra ,y ,shift-fixnum))])))
+    (define cons-form
+      (lambda (a d)
+        (let ([tc (unique-name 'tmp)] [td (unique-name 'tmp)]
+              [tp (unique-name 'tmp)])
+          `(let ([,tc ,a] [,td ,d])
+             (let ([,tp (+ (alloc ,size-pair) ,tag-pair)])
+               (begin
+                 (mset! ,tp ,offset-car ,tc)
+                 (mset! ,tp ,offset-cdr ,td)
+                 ,tp))))))
+    (define make-vector-form
+      (lambda (size)
+        (let ([tp (unique-name 'tmp)])
+          (if (number? size)
+              `(let ([,tp (+ (alloc ,(+ disp-vector-data size)) ,tag-vector)])
+                 (begin (mset! ,tp ,offset-vector-length ,size) ,tp))
+              (let ([ts (unique-name 'tmp)])
+                `(let ([,ts ,size])
+                   (let ([,tp (+ (alloc (+ ,disp-vector-data ,ts)) ,tag-vector)])
+                     (begin (mset! ,tp ,offset-vector-length ,ts) ,tp))))))))
+    (define value-prim
+      (lambda (p a*)
+        (case p
+          [(+ -) `(,p ,(car a*) ,(cadr a*))]
+          [(*) (mult (car a*) (cadr a*))]
+          [(car) `(mref ,(car a*) ,offset-car)]
+          [(cdr) `(mref ,(car a*) ,offset-cdr)]
+          [(cons) (cons-form (car a*) (cadr a*))]
+          [(make-vector) (make-vector-form (car a*))]
+          [(vector-length) `(mref ,(car a*) ,offset-vector-length)]
+          [(vector-ref) `(mref ,(car a*) ,(idx+ offset-vector-data (cadr a*)))]
+          [(void) $void])))
+    (define pred-prim
+      (lambda (p a*)
+        (case p
+          [(< <= = >= >) `(,p ,(car a*) ,(cadr a*))]
+          [(eq?) `(= ,(car a*) ,(cadr a*))]
+          [(null?) `(= ,(car a*) ,$nil)]
+          [(pair?) `(= (logand ,(car a*) ,mask-pair) ,tag-pair)]
+          [(vector?) `(= (logand ,(car a*) ,mask-vector) ,tag-vector)]
+          [(fixnum?) `(= (logand ,(car a*) ,mask-fixnum) ,tag-fixnum)]
+          [(boolean?) `(= (logand ,(car a*) ,mask-boolean) ,tag-boolean)])))
+    (define effect-prim
+      (lambda (p a*)
+        (case p
+          [(set-car!) `(mset! ,(car a*) ,offset-car ,(cadr a*))]
+          [(set-cdr!) `(mset! ,(car a*) ,offset-cdr ,(cadr a*))]
+          [(vector-set!)
+           `(mset! ,(car a*) ,(idx+ offset-vector-data (cadr a*)) ,(caddr a*))])))
+    (define Value
+      (lambda (v)
+        (match v
+          [(quote ,i) (Immediate i)]
+          [,lbl (guard (label? lbl)) lbl]
+          [,u (guard (uvar? u)) u]
+          [(if ,[Pred -> p] ,[Value -> c] ,[Value -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Effect -> e*] ... ,[Value -> v]) (make-begin `(,@e* ,v))]
+          [(let ([,u* ,[Value -> r*]] ...) ,[Value -> body])
+           `(let ([,u* ,r*] ...) ,body)]
+          [(,p ,[Value -> a*] ...) (guard (value-prim? p)) (value-prim p a*)]
+          [(,[Value -> rator] ,[Value -> rand*] ...) `(,rator ,@rand*)])))
+    (define Pred
+      (lambda (pr)
+        (match pr
+          [(true) '(true)]
+          [(false) '(false)]
+          [(if ,[Pred -> p] ,[Pred -> c] ,[Pred -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Effect -> e*] ... ,[Pred -> p]) (make-begin `(,@e* ,p))]
+          [(let ([,u* ,[Value -> r*]] ...) ,[Pred -> body])
+           `(let ([,u* ,r*] ...) ,body)]
+          [(,p ,[Value -> a*] ...) (guard (pred-prim? p)) (pred-prim p a*)])))
+    (define Effect
+      (lambda (ef)
+        (match ef
+          [(nop) '(nop)]
+          [(if ,[Pred -> p] ,[Effect -> c] ,[Effect -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Effect -> e*] ... ,[Effect -> e]) (make-begin `(,@e* ,e))]
+          [(let ([,u* ,[Value -> r*]] ...) ,[Effect -> body])
+           `(let ([,u* ,r*] ...) ,body)]
+          [(,p ,[Value -> a*] ...) (guard (effect-prim? p)) (effect-prim p a*)]
+          [(,[Value -> rator] ,[Value -> rand*] ...) `(,rator ,@rand*)])))
+    (match program
+      [(letrec ([,label (lambda (,fml* ...) ,[Value -> body*])] ...) ,[Value -> body])
+       `(letrec ([,label (lambda (,fml* ...) ,body*)] ...) ,body)]
+      [,x (format-error who "invalid Program ~s" x)])))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; uncover-locals  (a9)
