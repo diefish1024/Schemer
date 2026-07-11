@@ -153,6 +153,7 @@
                (lambda (ef)
                  (match ef
                    [(nop) '(nop)]
+                   [(mset! ,b ,o ,v) `(mset! ,b ,o ,v)]
                    [(set! ,var ,rhs) `(set! ,var ,rhs)]
                    [(return-point ,rp-lab ,tail)
                     (make-begin
@@ -265,10 +266,49 @@
                     (let ([u (new-u)])
                       (make-begin (list `(set! ,u ,t2) `(,op ,t1 ,u))))]
                    [else `(,op ,t1 ,t2)])))
+             ;; a memory operand needs its base in a register and its
+             ;; offset in a register or int32.  force-mem returns
+             ;; (values base^ off^ pre*) with any needed temporaries.
+             (define force-mem
+               (lambda (base off)
+                 (let* ([pre* '()]
+                        [base^ (if (or (mem? base) (int? base) (label? base))
+                                   (let ([u (new-u)])
+                                     (set! pre* (cons `(set! ,u ,base) pre*)) u)
+                                   base)]
+                        [off^ (if (or (mem? off) (label? off)
+                                      (and (int? off) (not (int32? off))))
+                                  (let ([u (new-u)])
+                                    (set! pre* (cons `(set! ,u ,off) pre*)) u)
+                                  off)])
+                   (values base^ off^ (reverse pre*)))))
+             ;; put a triv into a register temp if it can't be a source/dest
+             ;; operand directly (memory, oversized int, or label).
+             (define force-reg
+               (lambda (triv k)
+                 (if (or (mem? triv) (label? triv)
+                         (and (int? triv) (not (int32? triv))))
+                     (let ([u (new-u)])
+                       (make-begin (list `(set! ,u ,triv) (k u))))
+                     (k triv))))
              (define Effect
                (lambda (ef)
                  (match ef
                    [(nop) '(nop)]
+                   [(set! ,var (mref ,base ,off))
+                    ;; movq (mref b o) -> var; a memory dest needs a reg source
+                    (let-values ([(b o pre*) (force-mem base off)])
+                      (if (mem? var)
+                          (let ([u (new-u)])
+                            (make-begin `(,@pre* (set! ,u (mref ,b ,o)) (set! ,var ,u))))
+                          (make-begin `(,@pre* (set! ,var (mref ,b ,o))))))]
+                   [(mset! ,base ,off ,triv)
+                    ;; store val at (b o); the store stays an mset! (a
+                    ;; well-formed UIL form) and its value must be a reg
+                    ;; or int32 so it maps to a legal movq source.
+                    (let-values ([(b o pre*) (force-mem base off)])
+                      (make-begin
+                        `(,@pre* ,(force-reg triv (lambda (v) `(mset! ,b ,o ,v))))))]
                    [(set! ,var (,op ,t1 ,t2)) (select-binop var op t1 t2)]
                    [(set! ,var ,t) (select-move var t)]
                    [(return-point ,rp-lab ,[Tail -> tail]) `(return-point ,rp-lab ,tail)]
@@ -329,7 +369,12 @@
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 (define-who assign-registers
   (lambda (program)
-    (define k (length registers))
+    ;; The allocation pointer holds the live heap cursor across every
+    ;; function -- including callees that never mention it -- so it is
+    ;; invisible to their local liveness and must never be handed out as
+    ;; a home.  Reserve it globally by excluding it from the pool.
+    (define usable* (remq allocation-pointer-register registers))
+    (define k (length usable*))
     ;; returns (values assignments spills); unspillables must get a register
     (define color
       (lambda (spillable* unspillable* ct)
@@ -356,7 +401,7 @@
               (let* ([u (pick uvar* ct)]
                      [u-conf (cdr (assq u ct))])
                 (let-values ([(assignments spills) (rec (remq u uvar*) (remove-var u ct))])
-                  (let ([avail (difference registers (used u-conf assignments))])
+                  (let ([avail (difference usable* (used u-conf assignments))])
                     (cond
                       [(pair? avail) (values (cons (list u (car avail)) assignments) spills)]
                       [(spillable? u) (values assignments (cons u spills))]
@@ -468,6 +513,7 @@
       (lambda (ef)
         (match ef
           [(nop) '(nop)]
+          [(mset! ,b ,o ,v) `(mset! ,b ,o ,v)]
           [(set! ,var ,rhs) `(set! ,var ,rhs)]
           [(return-point ,rp-lab ,[Tail -> t]) `(return-point ,rp-lab ,t)]
           [(if ,[Pred -> p] ,[Effect -> c] ,[Effect -> a]) `(if ,p ,c ,a)]

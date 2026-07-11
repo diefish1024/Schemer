@@ -43,6 +43,12 @@
                    [(if ,[Pred -> p] ,[Value -> c] ,[Value -> a]) `(if ,p ,c ,a)]
                    [(begin ,[Effect -> ef*] ... ,[Value -> v])
                     (make-begin `(,@ef* ,v))]
+                   [(alloc ,v)
+                    (let-values ([(t* ef*) (Triv* (list v))])
+                      (make-begin `(,@ef* (alloc ,@t*))))]
+                   [(mref ,v1 ,v2)
+                    (let-values ([(t* ef*) (Triv* (list v1 v2))])
+                      (make-begin `(,@ef* (mref ,@t*))))]
                    [(,binop ,v1 ,v2) (guard (binop? binop))
                     (let-values ([(t* ef*) (Triv* (list v1 v2))])
                       (make-begin `(,@ef* (,binop ,@t*))))]
@@ -54,6 +60,9 @@
                  (match ef
                    [(nop) '(nop)]
                    [(set! ,uvar ,[Value -> v]) `(set! ,uvar ,v)]
+                   [(mset! ,v1 ,v2 ,v3)
+                    (let-values ([(t* ef*) (Triv* (list v1 v2 v3))])
+                      (make-begin `(,@ef* (mset! ,@t*))))]
                    [(if ,[Pred -> p] ,[Effect -> c] ,[Effect -> a]) `(if ,p ,c ,a)]
                    [(begin ,[Effect -> ef*] ... ,[Effect -> e])
                     (make-begin `(,@ef* ,e))]
@@ -78,6 +87,12 @@
                    [(if ,[Pred -> p] ,[Tail -> c] ,[Tail -> a]) `(if ,p ,c ,a)]
                    [(begin ,[Effect -> ef*] ... ,[Tail -> t])
                     (make-begin `(,@ef* ,t))]
+                   [(alloc ,v)
+                    (let-values ([(t* ef*) (Triv* (list v))])
+                      (make-begin `(,@ef* (alloc ,@t*))))]
+                   [(mref ,v1 ,v2)
+                    (let-values ([(t* ef*) (Triv* (list v1 v2))])
+                      (make-begin `(,@ef* (mref ,@t*))))]
                    [(,binop ,v1 ,v2) (guard (binop? binop))
                     (let-values ([(t* ef*) (Triv* (list v1 v2))])
                       (make-begin `(,@ef* (,binop ,@t*))))]
@@ -152,6 +167,7 @@
     (define fp frame-pointer-register)
     (define rv return-value-register)
     (define ra return-address-register)
+    (define ap allocation-pointer-register)
     ;; nth-arg-locations: registers first, then fv0, fv1, ...
     (define arg-locations
       (lambda (n)
@@ -190,7 +206,7 @@
                    (make-begin
                      `(,@set-args
                        (set! ,ra ,rp)
-                       (,rator ,fp ,ra ,@locs))))))
+                       (,rator ,fp ,ra ,ap ,@locs))))))
              ;; A nontail call: wrap a return-point.  Frame args go into
              ;; fresh new-frame variables (assign-new-frame places them).
              (define Nontail-call
@@ -213,12 +229,16 @@
                          `(,@set-frame
                            ,@set-reg
                            (set! ,ra ,rp-lab)
-                           (,rator ,fp ,ra ,@locs)))))))
+                           (,rator ,fp ,ra ,ap ,@locs)))))))
              (define Tail
                (lambda (t)
                  (match t
                    [(if ,[Pred -> p] ,[Tail -> c] ,[Tail -> a]) `(if ,p ,c ,a)]
                    [(begin ,[Effect -> ef*] ... ,[Tail -> t]) (make-begin `(,@ef* ,t))]
+                   [(alloc ,v)
+                    (make-begin `((set! ,rv (alloc ,v)) (,rp ,fp ,rv)))]
+                   [(mref ,t1 ,t2)
+                    (make-begin `((set! ,rv (mref ,t1 ,t2)) (,rp ,fp ,rv)))]
                    [(,binop ,x ,y) (guard (binop? binop))
                     (make-begin `((set! ,rv (,binop ,x ,y)) (,rp ,fp ,rv)))]
                    [,triv (guard (triv? triv))
@@ -228,6 +248,9 @@
                (lambda (ef)
                  (match ef
                    [(nop) '(nop)]
+                   [(mset! ,t1 ,t2 ,t3) `(mset! ,t1 ,t2 ,t3)]
+                   [(set! ,var (alloc ,v)) `(set! ,var (alloc ,v))]
+                   [(set! ,var (mref ,t1 ,t2)) `(set! ,var (mref ,t1 ,t2))]
                    [(set! ,var (,binop ,x ,y)) (guard (binop? binop))
                     `(set! ,var (,binop ,x ,y))]
                    [(set! ,var (,rator ,rand* ...))       ; nontail call, keep value
@@ -263,3 +286,20 @@
          `(letrec ([,label (lambda () ,body^*)] ...)
             ,(Body body '())))]
       [,x (format-error who "invalid Program ~s" x)])))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; expose-allocation-pointer  (a8)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Turn each allocation into an explicit bump of the allocation-pointer
+;;; register: (set! x (alloc n)) => (begin (set! x ap) (set! ap (+ ap n))).
+;;; A grammar-independent tree walk suffices; by this point alloc only
+;;; appears as the right-hand side of a set!.
+(define-who expose-allocation-pointer
+  (lambda (program)
+    (define ap allocation-pointer-register)
+    (let walk ([x program])
+      (match x
+        [(set! ,var (alloc ,n))
+         `(begin (set! ,var ,ap) (set! ,ap (+ ,ap ,n)))]
+        [(,[walk -> a] . ,[walk -> d]) (cons a d)]
+        [,atom atom]))))

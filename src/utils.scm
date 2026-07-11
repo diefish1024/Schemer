@@ -41,7 +41,9 @@
     (define rhs-uses
       (lambda (rhs)
         (if (pair? rhs)
-            (match rhs [(,op ,t1 ,t2) (->set (list t1 t2))])
+            (match rhs
+              [(mref ,t1 ,t2) (->set (list t1 t2))]
+              [(,op ,t1 ,t2) (->set (list t1 t2))])
             (->set (list rhs)))))
     (define Effect*
       (lambda (ef* live)
@@ -60,6 +62,8 @@
            ;; the inner tail's live-out is `live` (call-live), which flows
            ;; around the call to the return point
            (Tail tail live)]
+          [(mset! ,b ,o ,v)               ; store: reads b, o, and the value
+           (union live (->set (list b o v)))]
           [(set! ,lhs ,rhs)
            (let ([live^ (difference live (list lhs))])
              (record-conflict! lhs
@@ -100,6 +104,7 @@
       (lambda (ef)
         (match ef
           [(nop) '(nop)]
+          [(mset! ,b ,o ,t) `(mset! ,(v b) ,(v o) ,(v t))]
           [(set! ,var (,op ,t1 ,t2)) `(set! ,(v var) (,op ,(v t1) ,(v t2)))]
           [(set! ,var ,t)
            (let ([var^ (v var)] [t^ (v t)])

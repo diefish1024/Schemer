@@ -23,6 +23,12 @@
       (lambda (ef off)
         (match ef
           [(nop) (values '(nop) off)]
+          [(mset! ,b ,o ,t)
+           ;; store: rewrite any frame-vars in base/offset/value
+           (values `(mset! ,(fv->disp b off) ,(fv->disp o off) ,(fv->disp t off)) off)]
+          [(set! ,v (mref ,b ,o))
+           ;; load: rewrite frame-vars in dest and base/offset
+           (values `(set! ,(fv->disp v off) (mref ,(fv->disp b off) ,(fv->disp o off))) off)]
           [(set! ,v (,op ,t1 ,t2)) (guard (eq? v fp) (memq op '(+ -)) (int? t2))
            ;; frame-pointer adjustment: shift the running offset
            (values `(set! ,fp (,op ,fp ,t2))
@@ -81,6 +87,49 @@
        (let ([tail*^ (map (lambda (t) (let-values ([(t^ o) (Tail t 0)]) t^)) tail*)]
              [tail^ (let-values ([(t^ o) (Tail tail 0)]) t^)])
          `(letrec ([,label (lambda () ,tail*^)] ...) ,tail^))]
+      [,x (format-error who "invalid Program ~s" x)])))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; expose-memory-operands  (a8)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Turn mref / mset! into displacement or indexed memory operands.  A
+;;; disp-opnd is used when the offset is an integer, an index-opnd when
+;;; both base and offset are registers.  Runs after expose-frame-var so
+;;; that base/offset are already registers or integers.
+(define-who expose-memory-operands
+  (lambda (program)
+    (define mem-opnd
+      (lambda (base off)
+        (if (int? off)
+            (make-disp-opnd base off)
+            (make-index-opnd base off))))
+    (define Effect
+      (lambda (ef)
+        (match ef
+          [(nop) '(nop)]
+          [(mset! ,base ,off ,triv) `(set! ,(mem-opnd base off) ,triv)]
+          [(set! ,var (mref ,base ,off)) `(set! ,var ,(mem-opnd base off))]
+          [(set! ,var ,rhs) `(set! ,var ,rhs)]
+          [(return-point ,rp-lab ,[Tail -> t]) `(return-point ,rp-lab ,t)]
+          [(if ,[Pred -> p] ,[Effect -> c] ,[Effect -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Effect -> ef*] ... ,[Effect -> e]) (make-begin `(,@ef* ,e))])))
+    (define Pred
+      (lambda (pr)
+        (match pr
+          [(true) '(true)]
+          [(false) '(false)]
+          [(,relop ,t1 ,t2) (guard (relop? relop)) `(,relop ,t1 ,t2)]
+          [(if ,[Pred -> p] ,[Pred -> c] ,[Pred -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Effect -> ef*] ... ,[Pred -> p]) (make-begin `(,@ef* ,p))])))
+    (define Tail
+      (lambda (t)
+        (match t
+          [(if ,[Pred -> p] ,[Tail -> c] ,[Tail -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Effect -> ef*] ... ,[Tail -> t]) (make-begin `(,@ef* ,t))]
+          [(,triv ,loc* ...) `(,triv ,@loc*)])))
+    (match program
+      [(letrec ([,label (lambda () ,[Tail -> tail*])] ...) ,[Tail -> tail])
+       `(letrec ([,label (lambda () ,tail*)] ...) ,tail)]
       [,x (format-error who "invalid Program ~s" x)])))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
