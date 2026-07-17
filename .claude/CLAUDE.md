@@ -39,4 +39,4 @@
 - 遇到 match 子句：结构相同/元数不同的模式靠顺序区分，通配 `,x` 兜底放最后。
 
 ## 当前进度
-a1–a5 **已完成并各自 commit**，测试：a1 17/17、a2 29/29、a3 50/50、a4 55/56（最后 1 个需 a5 溢出，文档已说明）、a5 81/81。下一步从 `git merge --no-edit upstream/a6` 开始。
+a1–a15 **全部完成并各自 commit**，编译器完结。近几节测试：a12 329/329、a13 164/164、a14 163/163、a15 valid 164/164 + invalid 87/87 全部被 parse-scheme 拒绝。剩余可做：docs/challenge.pdf 的两个加分优化（closure 优化 analyze-closure-size / optimize-free / optimize-self-reference 等）。
