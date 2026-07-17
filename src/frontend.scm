@@ -8,6 +8,226 @@
 ;;;   a12: uncover-free  convert-closures  introduce-procedure-primitives
 ;;;   a13: optimize-direct-call  remove-anonymous-lambda
 ;;;        sanitize-binding-forms  optimize-known-call
+;;;   a14: convert-complex-datum  uncover-assigned  purify-letrec
+;;;        convert-assignments
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; convert-complex-datum  (a14)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Quoted data may now be pairs and vectors.  Each complex constant is
+;;; replaced by a fresh variable; the code that builds the structure
+;;; (cons / make-vector + vector-set!) is collected into a single let
+;;; wrapped around the whole program, so each constant is built once.
+(define-who convert-complex-datum
+  (lambda (program)
+    (define bind* '())                  ; accumulated [tmp build-expr]
+    (define immediate?
+      (lambda (d)
+        (or (memq d '(#t #f ()))
+            (and (integer? d) (exact? d) (fixnum-range? d)))))
+    (define build                       ; datum -> expression constructing it
+      (lambda (d)
+        (cond
+          [(pair? d) `(cons ,(build (car d)) ,(build (cdr d)))]
+          [(vector? d)
+           (let ([t (unique-name 'tmp)] [n (vector-length d)])
+             `(let ([,t (make-vector (quote ,n))])
+                ,(make-begin
+                   `(,@(let loop ([i 0] [acc '()])
+                         (if (= i n)
+                             (reverse acc)
+                             (loop (+ i 1)
+                               (cons `(vector-set! ,t (quote ,i)
+                                        ,(build (vector-ref d i)))
+                                     acc))))
+                     ,t))))]
+          [else `(quote ,d)])))
+    (define Expr
+      (lambda (e)
+        (match e
+          [,u (guard (uvar? u)) u]
+          [(quote ,d)
+           (if (immediate? d)
+               `(quote ,d)
+               (let ([t (unique-name 'tmp)])
+                 (set! bind* (cons `[,t ,(build d)] bind*))
+                 t))]
+          [(if ,[Expr -> p] ,[Expr -> c] ,[Expr -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Expr -> e*] ... ,[Expr -> t]) (make-begin `(,@e* ,t))]
+          [(lambda (,fml* ...) ,[Expr -> body]) `(lambda (,fml* ...) ,body)]
+          [(let ([,u* ,[Expr -> r*]] ...) ,[Expr -> body])
+           `(let ([,u* ,r*] ...) ,body)]
+          [(letrec ([,u* ,[Expr -> r*]] ...) ,[Expr -> body])
+           `(letrec ([,u* ,r*] ...) ,body)]
+          [(set! ,u ,[Expr -> e]) `(set! ,u ,e)]
+          [(,p ,[Expr -> a*] ...) (guard (prim? p)) `(,p ,@a*)]
+          [(,[Expr -> rator] ,[Expr -> rand*] ...) `(,rator ,@rand*)])))
+    (let ([body (Expr program)])
+      (if (null? bind*) body `(let ,bind* ,body)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; uncover-assigned  (a14)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Record, at each binding form, which of its variables are assigned
+;;; somewhere in their scope: the body of every lambda/let/letrec gets
+;;; wrapped in (assigned (uvar*) body), possibly with an empty list.
+;;; Structured like uncover-free: Expr returns (values expr^ assigned*).
+(define-who uncover-assigned
+  (lambda (program)
+    (define Expr
+      (lambda (e)
+        (match e
+          [,u (guard (uvar? u)) (values u '())]
+          [(quote ,i) (values `(quote ,i) '())]
+          [(if ,[Expr -> p pa] ,[Expr -> c ca] ,[Expr -> a aa])
+           (values `(if ,p ,c ,a) (union pa ca aa))]
+          [(begin ,[Expr -> e* ea*] ... ,[Expr -> t ta])
+           (values (make-begin `(,@e* ,t)) (apply union ta ea*))]
+          [(lambda (,fml* ...) ,[Expr -> body ba])
+           (values `(lambda (,fml* ...) (assigned ,(intersection ba fml*) ,body))
+                   (difference ba fml*))]
+          [(let ([,x* ,[Expr -> r* ra*]] ...) ,[Expr -> body ba])
+           (values `(let ([,x* ,r*] ...) (assigned ,(intersection ba x*) ,body))
+                   (union (apply union '() ra*) (difference ba x*)))]
+          [(letrec ([,x* ,[Expr -> r* ra*]] ...) ,[Expr -> body ba])
+           ;; letrec scope covers the right-hand sides as well
+           (let ([all (apply union ba ra*)])
+             (values `(letrec ([,x* ,r*] ...) (assigned ,(intersection all x*) ,body))
+                     (difference all x*)))]
+          [(set! ,x ,[Expr -> e ea]) (values `(set! ,x ,e) (union `(,x) ea))]
+          [(,p ,[Expr -> a* aa*] ...) (guard (prim? p))
+           (values `(,p ,@a*) (apply union '() aa*))]
+          [(,[Expr -> rator ra] ,[Expr -> rand* randa*] ...)
+           (values `(,rator ,@rand*) (apply union ra randa*))])))
+    (let-values ([(e _) (Expr program)]) e)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; purify-letrec  (a14)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; letrec right-hand sides may be arbitrary expressions; rewrite so
+;;; every letrec binds only unassigned variables to lambdas (its assigned
+;;; wrapper is then superfluous and dropped).  Bindings are partitioned
+;;; into simple / lambda / complex and rebuilt as
+;;;   (let ([xs es] ...) (assigned ()
+;;;     (let ([xc (void)] ...) (assigned (xc ...)
+;;;       (letrec ([xl el] ...)
+;;;         (begin (let ([xt ec] ...) (assigned ()
+;;;                  (begin (set! xc xt) ...)))
+;;;                body))))))
+;;; with each empty layer suppressed.
+(define-who purify-letrec
+  (lambda (program)
+    (define lambda?
+      (lambda (x) (and (pair? x) (eq? (car x) 'lambda))))
+    ;; simple: cannot reference the letrec-bound variables and cannot
+    ;; contain an application (so it cannot capture a continuation if
+    ;; call/cc is ever added).  Conservative: quote, other variables,
+    ;; if/begin, and prim calls with simple operands only.
+    (define simple?
+      (lambda (e bound*)
+        (let f ([e e])
+          (match e
+            [,u (guard (uvar? u)) (not (memq u bound*))]
+            [(quote ,i) #t]
+            [(if ,p ,c ,a) (and (f p) (f c) (f a))]
+            [(begin ,e* ... ,t) (and (andmap f e*) (f t))]
+            [(,p ,a* ...) (guard (prim? p)) (andmap f a*)]
+            [,x #f]))))
+    (define Expr
+      (lambda (e)
+        (match e
+          [,u (guard (uvar? u)) u]
+          [(quote ,i) `(quote ,i)]
+          [(if ,[Expr -> p] ,[Expr -> c] ,[Expr -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Expr -> e*] ... ,[Expr -> t]) (make-begin `(,@e* ,t))]
+          [(lambda (,fml* ...) (assigned (,a* ...) ,[Expr -> body]))
+           `(lambda (,fml* ...) (assigned (,a* ...) ,body))]
+          [(let ([,x* ,[Expr -> r*]] ...) (assigned (,a* ...) ,[Expr -> body]))
+           `(let ([,x* ,r*] ...) (assigned (,a* ...) ,body))]
+          [(letrec ([,x* ,[Expr -> e*]] ...) (assigned (,a* ...) ,[Expr -> body]))
+           (let loop ([xe* (map list x* e*)] [s* '()] [l* '()] [c* '()])
+             (if (null? xe*)
+                 (let* ([s* (reverse s*)] [l* (reverse l*)] [c* (reverse c*)]
+                        [xc* (map car c*)]
+                        [t* (map (lambda (_) (unique-name 't)) c*)]
+                        [inner
+                          (if (null? c*)
+                              body
+                              (make-begin
+                                `((let ,(map (lambda (t c) `[,t ,(cadr c)]) t* c*)
+                                    (assigned ()
+                                      ,(make-begin
+                                         (map (lambda (x t) `(set! ,x ,t)) xc* t*))))
+                                  ,body)))]
+                        [rec (if (null? l*) inner `(letrec ,l* ,inner))]
+                        [clet (if (null? c*)
+                                  rec
+                                  `(let ,(map (lambda (x) `[,x (void)]) xc*)
+                                     (assigned ,xc* ,rec)))])
+                   (if (null? s*) clet `(let ,s* (assigned () ,clet))))
+                 (let ([x (caar xe*)] [e (cadar xe*)] [rest (cdr xe*)])
+                   (cond
+                     [(and (not (memq x a*)) (lambda? e))
+                      (loop rest s* (cons `[,x ,e] l*) c*)]
+                     [(and (not (memq x a*)) (simple? e x*))
+                      (loop rest (cons `[,x ,e] s*) l* c*)]
+                     [else (loop rest s* l* (cons `[,x ,e] c*))]))))]
+          [(set! ,x ,[Expr -> e]) `(set! ,x ,e)]
+          [(,p ,[Expr -> a*] ...) (guard (prim? p)) `(,p ,@a*)]
+          [(,[Expr -> rator] ,[Expr -> rand*] ...) `(,rator ,@rand*)])))
+    (Expr program)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; convert-assignments  (a14)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Assignment conversion: each assigned variable's value lives in a
+;;; freshly allocated pair so the location can be shared by closures.
+;;; The binder binds a fresh t instead; (assigned (x ...) e) becomes
+;;; (let ([x (cons t (void))] ...) e); references become (car x) and
+;;; (set! x e) becomes (set-car! x e).  Output is the a13 language.
+(define-who convert-assignments
+  (lambda (program)
+    ;; new-name* for a binding list: assigned vars are renamed to fresh
+    ;; temporaries; returns (values name*^ [x (cons t (void))]*)
+    (define rebind
+      (lambda (name* a*)
+        (let loop ([n* name*] [new* '()] [bind* '()])
+          (if (null? n*)
+              (values (reverse new*) (reverse bind*))
+              (let ([n (car n*)])
+                (if (memq n a*)
+                    (let ([t (unique-name 't)])
+                      (loop (cdr n*) (cons t new*)
+                        (cons `[,n (cons ,t (void))] bind*)))
+                    (loop (cdr n*) (cons n new*) bind*)))))))
+    (define wrap
+      (lambda (bind* body)
+        (if (null? bind*) body `(let ,bind* ,body))))
+    (define Expr
+      (lambda (env)                     ; env: assigned uvars in scope
+        (lambda (e)
+          (match e
+            [,u (guard (uvar? u)) (if (memq u env) `(car ,u) u)]
+            [(quote ,i) `(quote ,i)]
+            [(if ,[(Expr env) -> p] ,[(Expr env) -> c] ,[(Expr env) -> a])
+             `(if ,p ,c ,a)]
+            [(begin ,[(Expr env) -> e*] ... ,[(Expr env) -> t])
+             (make-begin `(,@e* ,t))]
+            [(lambda (,fml* ...) (assigned (,a* ...) ,body))
+             (let-values ([(fml* bind*) (rebind fml* a*)])
+               `(lambda (,fml* ...)
+                  ,(wrap bind* ((Expr (append a* env)) body))))]
+            [(let ([,x* ,[(Expr env) -> r*]] ...) (assigned (,a* ...) ,body))
+             (let-values ([(x* bind*) (rebind x* a*)])
+               `(let ([,x* ,r*] ...)
+                  ,(wrap bind* ((Expr (append a* env)) body))))]
+            [(letrec ([,x* ,[(Expr env) -> lam*]] ...) ,[(Expr env) -> body])
+             `(letrec ([,x* ,lam*] ...) ,body)]
+            [(set! ,x ,[(Expr env) -> e]) `(set-car! ,x ,e)]
+            [(,p ,[(Expr env) -> a*] ...) (guard (prim? p)) `(,p ,@a*)]
+            [(,[(Expr env) -> rator] ,[(Expr env) -> rand*] ...)
+             `(,rator ,@rand*)]))))
+    ((Expr '()) program)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; optimize-direct-call  (a13)
