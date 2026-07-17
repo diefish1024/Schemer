@@ -6,6 +6,114 @@
 ;;;   a10: specify-representation  (Scheme datatypes/prims -> UIL ptrs)
 ;;;   a11: lift-letrec  normalize-context  (letrec anywhere; context split)
 ;;;   a12: uncover-free  convert-closures  introduce-procedure-primitives
+;;;   a13: optimize-direct-call  remove-anonymous-lambda
+;;;        sanitize-binding-forms  optimize-known-call
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; optimize-direct-call  (a13)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Lambda may now appear anywhere an expression may.  A direct call
+;;; ((lambda (fml*) body) rand*) is turned into (let ([fml* rand*] ...)
+;;; body) when the arities match, avoiding a closure allocation and an
+;;; indirect jump.  Input and output languages are the same.
+(define-who optimize-direct-call
+  (lambda (program)
+    (define Expr
+      (lambda (e)
+        (match e
+          [,u (guard (uvar? u)) u]
+          [(quote ,i) `(quote ,i)]
+          [(if ,[Expr -> p] ,[Expr -> c] ,[Expr -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Expr -> e*] ... ,[Expr -> t]) (make-begin `(,@e* ,t))]
+          [(lambda (,fml* ...) ,[Expr -> body]) `(lambda (,fml* ...) ,body)]
+          [(let ([,u* ,[Expr -> r*]] ...) ,[Expr -> body])
+           `(let ([,u* ,r*] ...) ,body)]
+          [(letrec ([,name* ,[Expr -> lam*]] ...) ,[Expr -> body])
+           `(letrec ([,name* ,lam*] ...) ,body)]
+          [(,p ,[Expr -> a*] ...) (guard (prim? p)) `(,p ,@a*)]
+          [((lambda (,fml* ...) ,body) ,rand* ...)
+           (guard (= (length fml*) (length rand*)))
+           `(let ([,fml* ,(map Expr rand*)] ...) ,(Expr body))]
+          [(,[Expr -> rator] ,[Expr -> rand*] ...) `(,rator ,@rand*)])))
+    (Expr program)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; remove-anonymous-lambda  (a13)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Give every lambda that is not the right-hand side of a let or letrec
+;;; binding a name:  lam -> (letrec ([anon lam]) anon).  A lambda in let
+;;; rhs position is left in place (sanitize-binding-forms lifts it).
+(define-who remove-anonymous-lambda
+  (lambda (program)
+    (define Lambda
+      (lambda (lam)
+        (match lam
+          [(lambda (,fml* ...) ,[Expr -> body]) `(lambda (,fml* ...) ,body)])))
+    (define Rhs                      ; let rhs: a lambda already has a name
+      (lambda (rhs)
+        (match rhs
+          [(lambda (,fml* ...) ,body) (Lambda rhs)]
+          [,e (Expr e)])))
+    (define Expr
+      (lambda (e)
+        (match e
+          [,u (guard (uvar? u)) u]
+          [(quote ,i) `(quote ,i)]
+          [(if ,[Expr -> p] ,[Expr -> c] ,[Expr -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Expr -> e*] ... ,[Expr -> t]) (make-begin `(,@e* ,t))]
+          [(lambda (,fml* ...) ,body)
+           (let ([anon (unique-name 'anon)])
+             `(letrec ([,anon ,(Lambda e)]) ,anon))]
+          [(let ([,u* ,r*] ...) ,[Expr -> body])
+           `(let ([,u* ,(map Rhs r*)] ...) ,body)]
+          [(letrec ([,name* ,lam*] ...) ,[Expr -> body])
+           `(letrec ([,name* ,(map Lambda lam*)] ...) ,body)]
+          [(,p ,[Expr -> a*] ...) (guard (prim? p)) `(,p ,@a*)]
+          [(,[Expr -> rator] ,[Expr -> rand*] ...) `(,rator ,@rand*)])))
+    (Expr program)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; sanitize-binding-forms  (a13)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Every lambda now has a name; make all those names letrec-bound.  The
+;;; lambda bindings of each let are lifted into a letrec wrapped around
+;;; the remaining let (sound because names are unique and there are no
+;;; assignments).  Empty let/letrec forms are suppressed.  Output is the
+;;; a12 source language.
+(define-who sanitize-binding-forms
+  (lambda (program)
+    (define make-let
+      (lambda (bind* body)
+        (if (null? bind*) body `(let ,bind* ,body))))
+    (define make-letrec
+      (lambda (bind* body)
+        (if (null? bind*) body `(letrec ,bind* ,body))))
+    (define lambda?
+      (lambda (x) (and (pair? x) (eq? (car x) 'lambda))))
+    (define Expr
+      (lambda (e)
+        (match e
+          [,u (guard (uvar? u)) u]
+          [(quote ,i) `(quote ,i)]
+          [(if ,[Expr -> p] ,[Expr -> c] ,[Expr -> a]) `(if ,p ,c ,a)]
+          [(begin ,[Expr -> e*] ... ,[Expr -> t]) (make-begin `(,@e* ,t))]
+          [(lambda (,fml* ...) ,[Expr -> body]) `(lambda (,fml* ...) ,body)]
+          [(let ([,u* ,[Expr -> r*]] ...) ,[Expr -> body])
+           ;; partition: lambda bindings go to a wrapping letrec
+           (let loop ([u* u*] [r* r*] [lam-bind* '()] [other-bind* '()])
+             (if (null? u*)
+                 (make-letrec (reverse lam-bind*)
+                   (make-let (reverse other-bind*) body))
+                 (if (lambda? (car r*))
+                     (loop (cdr u*) (cdr r*)
+                       (cons `[,(car u*) ,(car r*)] lam-bind*) other-bind*)
+                     (loop (cdr u*) (cdr r*)
+                       lam-bind* (cons `[,(car u*) ,(car r*)] other-bind*)))))]
+          [(letrec ([,name* ,[Expr -> lam*]] ...) ,[Expr -> body])
+           (make-letrec `([,name* ,lam*] ...) body)]
+          [(,p ,[Expr -> a*] ...) (guard (prim? p)) `(,p ,@a*)]
+          [(,[Expr -> rator] ,[Expr -> rand*] ...) `(,rator ,@rand*)])))
+    (Expr program)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; uncover-free  (a12)
@@ -82,6 +190,45 @@
                (let ([t (unique-name 'tmp)])
                  `(let ([,t ,rator]) (,t ,t ,@rand*))))])))
     (Expr program)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; optimize-known-call  (a13)
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;;; Runs between convert-closures and introduce-procedure-primitives.  A
+;;; call whose operator is a closures-bound uvar is turned into a direct
+;;; call to the corresponding label (the closure argument stays).  The
+;;; letrec/closures pair is treated as one composite form so the mapping
+;;; is visible in the letrec right-hand sides too (recursive calls).
+(define-who optimize-known-call
+  (lambda (program)
+    (define Expr
+      (lambda (env)                        ; env: alist uvar -> label
+        (lambda (e)
+          (match e
+            [,u (guard (uvar? u)) u]
+            [,l (guard (label? l)) l]
+            [(quote ,i) `(quote ,i)]
+            [(if ,[(Expr env) -> p] ,[(Expr env) -> c] ,[(Expr env) -> a])
+             `(if ,p ,c ,a)]
+            [(begin ,[(Expr env) -> e*] ... ,[(Expr env) -> t])
+             (make-begin `(,@e* ,t))]
+            [(let ([,u* ,[(Expr env) -> r*]] ...) ,[(Expr env) -> body])
+             `(let ([,u* ,r*] ...) ,body)]
+            [(letrec ([,label* (lambda (,fml** ...)
+                                 (bind-free (,bf** ...) ,lbody*))] ...)
+               (closures ([,name* ,clabel* ,cfree** ...] ...) ,cbody))
+             ;; closures names are known in the rhs bodies as well
+             (let* ([env (append (map cons name* clabel*) env)]
+                    [lbody* (map (Expr env) lbody*)]
+                    [cbody ((Expr env) cbody)])
+               `(letrec ([,label* (lambda (,fml** ...)
+                                    (bind-free (,bf** ...) ,lbody*))] ...)
+                  (closures ([,name* ,clabel* ,cfree** ...] ...) ,cbody)))]
+            [(,p ,[(Expr env) -> a*] ...) (guard (prim? p)) `(,p ,@a*)]
+            [(,rator ,[(Expr env) -> rand*] ...)
+             (let ([known (and (uvar? rator) (assq rator env))])
+               `(,(if known (cdr known) ((Expr env) rator)) ,@rand*))]))))
+    ((Expr '()) program)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; introduce-procedure-primitives  (a12)
